@@ -1,6 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+out/
 *.aux
 *.log
 *.out
 *.nav
 *.snm
 *.toc
+*.synctex.gz
