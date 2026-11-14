@@ -15,7 +15,8 @@ on LaTeX — see `latex_utils.py`.
 - [A2A Agent Protocol, 30 slides, 9 charts (PDF)](examples/a2a-agent-protocol-30-slides.pdf) —
   built by the A2A run (`run_a2a.py --topic "A2A Agent Protocol (Google Agent2Agent)" --slides 30`,
   search-grounded on Wikipedia): 30 slides, 9 charts (the full 9/9 visuals),
-  review passed round 3.
+  review passed. Slides 14 (Case Studies) and 18 (User Adoption) were
+  filled out from deep-research facts via `main.py --edit`.
 
 ## Flow
 
