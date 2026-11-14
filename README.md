@@ -94,6 +94,63 @@ Output in the `--out` folder: `presentation.tex`, `deck.json`,
 `outline.json`, `review.json`, and `presentation.pdf` if a LaTeX
 engine (`tectonic` or `pdflatex`) is installed.
 
+## Editing a deck with your comments
+
+```bash
+# Edit an existing deck — no slide is regenerated from scratch.
+# The Flow Editor applies each comment, then the deck is re-rendered
+# and re-compiled.
+python main.py --edit out/gemini/deck.json --outline out/gemini/outline.json \
+  --comments $'Slide 5: shorten the bullets to one line each\nDrop slide 12, it repeats slide 9' \
+  --out out/gemini-v2
+
+# Or apply comments on a fresh build (same flags work on run_a2a.py too).
+python main.py --topic "Google Gemini" --slides 6 \
+  --comments "overall: keep every bullet under 12 words" --out out/gemini
+```
+
+Comments are one per line, optionally aimed at a slide
+(`Slide 5: ...`, `overall: ...`); a JSON file works too
+(`--comments-file comments.json`, `{"comments": [{"slide": 5, "comment": "..."}]}`).
+A comment can rewrite, shorten, or drop a slide, or ask to
+`add a slide about X` — the new slide is written before the ending slide.
+Slide numbers are resolved to titles against the deck as you saw
+it, so adding or dropping a slide never shifts a later comment's
+target; a near-duplicate title (e.g. "Gemini Pricing Tiers" when
+"Pricing Tiers" already exists) is folded into the existing slide
+instead of added as a second one.
+
+## Building a deck from a source
+
+```bash
+# From a PDF — every slide is grounded in the document, not invented.
+python main.py --source ~/Downloads/paper.pdf --slides 10 --out out/paper
+
+# From a public GitHub repo (shallow-cloned: README + docs + file tree)
+# or a local folder/repo — topic defaults to the repo name.
+python main.py --source https://github.com/harikrishnad1997/Multi-agent-Presentation-Generator --slides 10 --out out/repo-deck
+```
+
+Sources: `.pdf`, `.txt`/`.md`, a local folder, or a public GitHub
+repo URL. The source text (capped at ~12k chars, README/docs first)
+goes to the Planner and to each Writer with one hard rule: base every
+bullet on a fact in the source, never invent one. For a private repo,
+clone it locally and pass the folder. Same flags work on `run_a2a.py`.
+
+## Search grounding (slides are not made up)
+
+Every topic build is grounded in web search by default — no flag
+needed. Before the Planner runs, the topic is searched on Wikipedia
+(top articles, disambiguation pages skipped, each candidate scored
+on the topic's own words) plus a DuckDuckGo abstract, and that text
+becomes the source the Planner and Writers must stick to, under the
+same "never invent a fact" rule as `--source`. The run prints what
+it was grounded in, e.g. `Grounded in web search: Wikipedia —
+Agent2Agent`. If search finds nothing reliable, the deck still
+builds from model knowledge but says so plainly instead of
+pretending to be grounded. `--no-search` turns it off; `--source`
+already grounds the deck, so search is skipped then.
+
 ## Tracing (Opik)
 
 One Opik trace per deck build — project `multi-agent-presentation-generator`,
@@ -137,4 +194,7 @@ tool-calling, so it works identically on both backends.
 - `src/presentation_generator/models.py` — Pydantic schemas agents speak
 - `src/presentation_generator/latex_utils.py` — Beamer rendering + validation
 - `src/presentation_generator/charts.py` — deterministic matplotlib charts
+- `src/presentation_generator/comments.py` — user comments that edit a deck
+- `src/presentation_generator/sources.py` — build a deck from a PDF / file / repo
+- `src/presentation_generator/search_grounding.py` — Wikipedia + DuckDuckGo grounding
 - `src/presentation_generator/tracing.py` — Opik tracing (no-op without a key)

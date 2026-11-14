@@ -43,6 +43,7 @@ def make_a2a_graph(urls: dict | None = None):
             "topic": state["topic"], "author": state.get("author", ""),
             "num_slides": state.get("num_slides", 6), "model": state.get("model"),
             "charts_enabled": bool(state.get("charts_enabled", True)),
+            "source_text": state.get("source_text", ""),
         })
         return {"outline": result["outline"], "attempts": 0, "slides": []}
 
@@ -62,7 +63,7 @@ def make_a2a_graph(urls: dict | None = None):
         result = call_agent_sync(base["writer"], {
             "brief": state["brief"], "outline": state["outline"],
             "prev_title": state.get("prev_title", ""), "next_title": state.get("next_title", ""),
-            "model": state.get("model"),
+            "model": state.get("model"), "source_text": state.get("source_text", ""),
         })
         return {"slides": [result["slide"]]}
 
@@ -73,7 +74,7 @@ def make_a2a_graph(urls: dict | None = None):
             "outline": state["outline"], "slides": slides,
             "review_issues": state.get("review_issues", ""),
             "topic": state.get("topic", ""), "num_slides": state.get("num_slides"),
-            "model": state.get("model"),
+            "model": state.get("model"), "comments": state.get("comments", ""),
         })
         deck = result["deck"]
         return {"deck": deck, "slides": deck["slides"]}
@@ -123,19 +124,36 @@ def make_a2a_graph(urls: dict | None = None):
 
 def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
             model: str | None = None, output_dir: str = "out",
-            charts_enabled: bool = True, urls: dict | None = None) -> dict:
+            charts_enabled: bool = True, urls: dict | None = None,
+            source_text: str = "", comments: str = "", search: bool = True) -> dict:
     from .tracing import flush, get_callbacks
+
+    grounding = {"mode": "source", "sources": []}
+    if not source_text and search:
+        from .search_grounding import ground_topic
+
+        found = ground_topic(topic)
+        if found.found:
+            source_text = found.text
+            grounding = {"mode": "search", "sources": found.sources}
+        else:
+            grounding = {"mode": "none", "sources": []}
+    elif not source_text:
+        grounding = {"mode": "none", "sources": []}
 
     graph = make_a2a_graph(urls)
     initial: PresentationState = {
         "topic": topic, "author": author, "institute": institute,
         "num_slides": num_slides, "model": model or "", "output_dir": output_dir,
         "slides": [], "attempts": 0, "charts_enabled": charts_enabled, "chart_count": 0,
+        "source_text": source_text, "comments": comments,
     }
     try:
         # Same OpikTracer callback as the in-process run: it traces the
         # orchestrator's nodes and LLM calls. Each A2A agent also traces
         # its own span server-side (see a2a_agents._JsonAgent).
-        return graph.invoke(initial, config={"callbacks": get_callbacks()})
+        result = graph.invoke(initial, config={"callbacks": get_callbacks()})
+        result["grounding"] = grounding
+        return result
     finally:
         flush()

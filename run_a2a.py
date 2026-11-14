@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from presentation_generator.a2a_agents import AGENT_CLASSES, PORTS  # noqa: E402
 from presentation_generator.graph_a2a import run_a2a  # noqa: E402
+from presentation_generator.sources import load_source  # noqa: E402
 from presentation_generator.tracing import status_line  # noqa: E402
 
 
@@ -39,13 +40,17 @@ def _wait_for_card(port: int, timeout: float = 60) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Multi-agent presentation generator over A2A (GPT)")
-    ap.add_argument("--topic", required=True)
+    ap.add_argument("--topic", default=None, help="Presentation topic (defaults to the source title with --source)")
+    ap.add_argument("--source", default=None, help="Build the deck from a source: a PDF, a .txt/.md file, a local folder/repo, or a public GitHub repo URL")
+    ap.add_argument("--comments", default=None, help="User comments to apply while editing, one per line")
+    ap.add_argument("--comments-file", default=None, help="File with comments, one per line or JSON")
     ap.add_argument("--author", default="Harikrishna Dev")
     ap.add_argument("--institute", default="University of Texas at Dallas")
     ap.add_argument("--slides", type=int, default=6)
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default="out-a2a")
     ap.add_argument("--no-charts", action="store_true")
+    ap.add_argument("--no-search", action="store_true", help="Skip web-search grounding (default: every topic build is grounded in Wikipedia search)")
     args = ap.parse_args()
 
     root = Path(__file__).parent
@@ -69,13 +74,29 @@ def main() -> int:
                 print(f"ERROR: presentation-{name} did not come up on :{port}")
                 return 1
             print(f"  card OK: http://127.0.0.1:{port}/.well-known/agent-card.json")
-        print(f"\nTopic: {args.topic}  |  slides: {args.slides}  |  charts: {'off' if args.no_charts else 'on'}  |  transport: A2A")
+        comments = ""
+        if args.comments_file:
+            comments = Path(args.comments_file).read_text(encoding="utf-8")
+        elif args.comments:
+            comments = args.comments
+        source_text = ""
+        topic = args.topic
+        if args.source:
+            source = load_source(args.source)
+            print(f"Source: {source.kind} — {source.ref} ({len(source.text)} chars)")
+            source_text = source.text
+            topic = topic or source.title
+        if not topic:
+            print("--topic is required (or pass --source so the topic comes from the source).")
+            return 2
+        print(f"\nTopic: {topic}  |  slides: {args.slides}  |  charts: {'off' if args.no_charts else 'on'}  |  transport: A2A")
         print(status_line())
         started = time.time()
         result = run_a2a(
-            topic=args.topic, author=args.author, institute=args.institute,
+            topic=topic, author=args.author, institute=args.institute,
             num_slides=args.slides, model=args.model, output_dir=args.out,
-            charts_enabled=not args.no_charts,
+            charts_enabled=not args.no_charts, source_text=source_text, comments=comments,
+            search=not args.no_search,
         )
         elapsed = time.time() - started
         deck = result.get("deck", {})
@@ -84,6 +105,13 @@ def main() -> int:
         for slide in deck.get("slides", []):
             chart = " + chart" if slide.get("chart_file") else ""
             print(f"  {slide['number']}. {slide['title']} ({len(slide.get('bullets', []))} bullets{chart})")
+        grounding = result.get("grounding", {})
+        if grounding.get("mode") == "search":
+            print(f"Grounded in web search: {'; '.join(grounding.get('sources', []))}")
+        elif grounding.get("mode") == "source":
+            print("Grounded in the source you gave (--source).")
+        elif grounding.get("mode") == "none":
+            print("Note: search found no reliable sources — this deck is from model knowledge only, verify before presenting.")
         if review.get("issues"):
             for issue in review["issues"]:
                 print(f"  - [{issue.get('severity')}] slide {issue.get('slide')}: {issue.get('issue')}")

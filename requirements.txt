@@ -7,3 +7,4 @@ a2a-sdk==0.3.26
 uvicorn
 httpx
 opik==2.2.138
+pypdf==7.1.0

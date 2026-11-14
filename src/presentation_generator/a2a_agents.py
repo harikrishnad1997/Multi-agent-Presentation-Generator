@@ -111,6 +111,7 @@ class PlannerAgent(_JsonAgent):
         outline = plan_outline(
             payload["topic"], payload.get("author", ""), int(payload.get("num_slides", 6)),
             payload.get("model"), bool(payload.get("charts_enabled", True)),
+            source_text=payload.get("source_text", ""),
         )
         return {"outline": outline.model_dump()}
 
@@ -124,7 +125,7 @@ class WriterAgent(_JsonAgent):
         outline = Outline.model_validate(payload["outline"])
         slide = write_one_slide(
             brief, outline, payload.get("prev_title", ""), payload.get("next_title", ""),
-            payload.get("model"),
+            payload.get("model"), source_text=payload.get("source_text", ""),
         )
         return {"slide": slide.model_dump()}
 
@@ -134,14 +135,24 @@ class EditorAgent(_JsonAgent):
     artifact_name = "deck"
 
     def run(self, payload: dict) -> dict:
+        from .comments import apply_comments, parse_comments
+
         outline = Outline.model_validate(payload["outline"])
         slides = [SlideContent.model_validate(s) for s in payload.get("slides", [])]
-        deck = edit_deck(
-            outline, slides, payload.get("model"),
-            review_issues=payload.get("review_issues", ""),
-            topic=payload.get("topic", ""),
-            num_slides=payload.get("num_slides"),
-        )
+        raw_comments = payload.get("comments", "")
+        if raw_comments:
+            deck = apply_comments(
+                Deck(title=outline.title, slides=slides), outline,
+                parse_comments(text=raw_comments), payload.get("model"),
+                topic=payload.get("topic", ""),
+            )
+        else:
+            deck = edit_deck(
+                outline, slides, payload.get("model"),
+                review_issues=payload.get("review_issues", ""),
+                topic=payload.get("topic", ""),
+                num_slides=payload.get("num_slides"),
+            )
         return {"deck": deck.model_dump()}
 
 

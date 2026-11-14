@@ -55,6 +55,8 @@ class PresentationState(TypedDict, total=False):
     compile_log: str
     charts_enabled: bool
     chart_count: int
+    source_text: str
+    comments: str
     # Per-branch Send payload for write_slide:
     brief: dict
     prev_title: str
@@ -88,6 +90,19 @@ def _chat_json(llm, system: str, user: str) -> dict:
 
 
 _ENDING_WORDS = ("conclusion", "summary", "takeaway", "final thought", "looking ahead", "wrap-up", "wrap up")
+
+
+_TITLE_STOPWORDS = {"the", "a", "an", "and", "of", "for", "in", "on", "to", "with", "how", "what", "why"}
+
+
+def norm_title_key(title: str, stopwords: set[str] | None = None) -> str:
+    """Title key for near-duplicate detection: lowercase words, minus
+    generic words and the deck's own topic words. So 'Gemini Pricing
+    Tiers' and 'Pricing Tiers' key the same — the planner/fill kept
+    producing both, and the reviewer then failed the deck on the pair."""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    drop = _TITLE_STOPWORDS | (stopwords or set())
+    return " ".join(sorted(set(words) - drop))
 
 
 def _is_ending(title: str) -> bool:
@@ -200,7 +215,8 @@ def _repair_outline(outline: Outline, n: int, visual_target: int, llm=None, topi
 
 
 # ---------------------------------------------------------------- planner
-def plan_outline(topic: str, author: str, num_slides: int, model: str | None, charts_enabled: bool) -> Outline:
+def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
+                 charts_enabled: bool, source_text: str = "") -> Outline:
     """Plan + validate + repair. Pure function, shared by the LangGraph
     node and by the A2A Planner agent — one implementation, two transports."""
     llm = get_llm(model)
@@ -221,7 +237,15 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None, ch
         "that can be charted in 3-8 numbers (e.g. 'adoption by year', 'share by sector'). "
         "No visual on a slide that has no numbers to show."
     )
+    if source_text:
+        system += (
+            " SOURCE RULE: base the outline ONLY on facts in the source material below. "
+            "Do not invent facts, numbers, names, or claims that are not in the source. "
+            "If the source is thin on a sub-topic, say so in the brief rather than inventing it."
+        )
     user = f"Topic: {topic}\nAuthor: {author}\nAudience: general, curious non-experts unless the topic says otherwise."
+    if source_text:
+        user += f"\n\nSource material (ground every slide in this):\n{source_text}"
     outline: Outline | None = None
     problems: list[str] = []
     for _attempt in range(3):
@@ -245,6 +269,7 @@ def planner(state: PresentationState) -> dict:
     outline = plan_outline(
         state["topic"], state.get("author", ""), state.get("num_slides", 6),
         state.get("model"), bool(state.get("charts_enabled", True)),
+        source_text=state.get("source_text", ""),
     )
     return {"outline": outline.model_dump(), "attempts": 0, "slides": []}
 
@@ -270,7 +295,8 @@ def route_planner(state: PresentationState):
 
 
 # ------------------------------------------------------------- slide writer
-def write_one_slide(brief: SlideBrief, outline: Outline, prev_title: str, next_title: str, model: str | None) -> SlideContent:
+def write_one_slide(brief: SlideBrief, outline: Outline, prev_title: str, next_title: str,
+                    model: str | None, source_text: str = "") -> SlideContent:
     """Write one slide. Pure function, shared by the LangGraph node and
     by the A2A Writer agent — one implementation, two transports."""
     llm = get_llm(model)
@@ -297,7 +323,10 @@ def write_one_slide(brief: SlideBrief, outline: Outline, prev_title: str, next_t
         f"Your slide #{brief.number}: {brief.title}\nBrief: {brief.brief}\n"
         f"Key points to cover: {', '.join(brief.key_points) or '(use your judgement)'}"
         + (f"\nVisual hint: {brief.visual_hint}" if brief.has_visual else "")
+        + (f"\n\nSource material — use only facts from here, never invent: \n{source_text}" if source_text else "")
     )
+    if source_text:
+        system += " SOURCE RULE: every bullet must be traceable to the source material. Do not invent facts or numbers not in it." 
     try:
         slide = SlideContent.model_validate(_chat_json(llm, system, user))
     except Exception:
@@ -321,7 +350,8 @@ def write_one_slide(brief: SlideBrief, outline: Outline, prev_title: str, next_t
 def write_slide(state: PresentationState) -> dict:
     brief = SlideBrief.model_validate(state["brief"])
     outline = Outline.model_validate(state["outline"])
-    slide = write_one_slide(brief, outline, state.get("prev_title") or "", state.get("next_title") or "", state.get("model"))
+    slide = write_one_slide(brief, outline, state.get("prev_title") or "", state.get("next_title") or "",
+                          state.get("model"), source_text=state.get("source_text", ""))
     return {"slides": [slide.model_dump()]}
 
 
@@ -381,11 +411,14 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
             edited.extend(fragment.slides)
         except Exception:
             edited.extend(chunk)  # editor failure must not lose slides
-    # Deterministic dedupe: same title twice, or near-identical bullets.
+    # Deterministic dedupe: same title twice (normalised — "Gemini
+    # Pricing Tiers" and "Pricing Tiers" are the same slide), or
+    # near-identical bullets.
+    topic_words = set(re.findall(r"[a-z0-9]+", outline.title.lower()))
     deduped: list[SlideContent] = []
     seen_titles: set[str] = set()
     for s in sorted(edited, key=lambda x: x.number):
-        key = s.title.strip().lower()
+        key = norm_title_key(s.title, topic_words)
         if key in seen_titles:
             continue
         seen_titles.add(key)
@@ -412,6 +445,17 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
             edited = body + ([ending] if ending else [])
         except Exception:
             pass
+    # The fill above can itself add a near-duplicate of an existing
+    # title, so dedupe once more before renumbering.
+    _seen: set[str] = set()
+    _final: list[SlideContent] = []
+    for s in sorted(edited, key=lambda x: x.number):
+        _key = norm_title_key(s.title, topic_words)
+        if _key in _seen:
+            continue
+        _seen.add(_key)
+        _final.append(s)
+    edited = _final
     # Normalise numbering in final order.
     for i, slide in enumerate(sorted(edited, key=lambda s: s.number), start=1):
         slide.number = i
@@ -428,12 +472,22 @@ def editor(state: PresentationState) -> dict:
         slides = [SlideContent.model_validate(s) for s in Deck.model_validate(state["deck"]).slides]
     else:
         slides = [SlideContent.model_validate(s) for s in state.get("slides", [])]
-    deck = edit_deck(
-        outline, slides, state.get("model"),
-        review_issues=state.get("review_issues", ""),
-        topic=state.get("topic", ""),
-        num_slides=state.get("num_slides"),
-    )
+    comments_raw = state.get("comments", "")
+    if comments_raw:
+        from .comments import apply_comments, parse_comments
+
+        deck = apply_comments(
+            Deck(title=outline.title, slides=slides), outline,
+            parse_comments(text=comments_raw), state.get("model"),
+            topic=state.get("topic", ""),
+        )
+    else:
+        deck = edit_deck(
+            outline, slides, state.get("model"),
+            review_issues=state.get("review_issues", ""),
+            topic=state.get("topic", ""),
+            num_slides=state.get("num_slides"),
+        )
     return {"deck": deck.model_dump(), "slides": [s.model_dump() for s in deck.slides]}
 
 
@@ -598,10 +652,26 @@ def build_graph():
 
 
 def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
-        model: str | None = None, output_dir: str = "out", charts_enabled: bool = True) -> dict:
+        model: str | None = None, output_dir: str = "out", charts_enabled: bool = True,
+        source_text: str = "", comments: str = "", search: bool = True) -> dict:
     from .tracing import flush, get_callbacks
 
     graph = build_graph()
+    grounding = {"mode": "source", "sources": []}
+    if not source_text and search:
+        # No --source: ground the topic in web search (Wikipedia +
+        # DuckDuckGo) so the slides are not made up. The search text
+        # becomes the source the planner/writers must stick to.
+        from .search_grounding import ground_topic
+
+        found = ground_topic(topic)
+        if found.found:
+            source_text = found.text
+            grounding = {"mode": "search", "sources": found.sources}
+        else:
+            grounding = {"mode": "none", "sources": []}
+    elif not source_text:
+        grounding = {"mode": "none", "sources": []}
     initial: PresentationState = {
         "topic": topic,
         "author": author,
@@ -613,10 +683,14 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         "attempts": 0,
         "charts_enabled": charts_enabled,
         "chart_count": 0,
+        "source_text": source_text,
+        "comments": comments,
     }
     try:
         # OpikTracer callback traces every LLM call and LangGraph node
         # when OPIK_API_KEY is set; empty list (no-op) otherwise.
-        return graph.invoke(initial, config={"callbacks": get_callbacks()})
+        result = graph.invoke(initial, config={"callbacks": get_callbacks()})
+        result["grounding"] = grounding
+        return result
     finally:
         flush()
