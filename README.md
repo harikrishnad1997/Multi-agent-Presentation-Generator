@@ -32,8 +32,10 @@ topic
 ## A2A version
 
 The same pipeline over Google's Agent2Agent protocol
-(`run_a2a.py`, `src/presentation_generator/a2a_*.py`,
-`graph_a2a.py`):
+(`run_a2a.py`, `src/presentation_generator/a2a_agents.py`,
+`src/presentation_generator/a2a_client.py`,
+`src/presentation_generator/a2a_server.py`,
+`src/presentation_generator/graph_a2a.py`):
 
 - Each agent — Planner, Writer, Editor, Chart, Reviewer — is a
   real A2A agent (`a2a-sdk==0.3.26`, the classic Starlette
@@ -63,13 +65,15 @@ from the edited deck, never from raw writer slides; the compiler
 now uses absolute output paths (the relative `-output-directory`
 + cwd combination made pdflatex fail to write).
 
-Why parallel writers + a separate editor: writers are fast in
-parallel (a 7-slide deck takes roughly the time of 1 slide) and each
-one stays strictly on its brief, but no single writer can see the
-whole story. The editor is the agent that can — it reorders, cuts
-duplicates, and smooths transitions. Results are collected by slide
-number, not finish order, so the deck never scrambles; if one slide
-fails, only that slide retries.
+Why parallel writers + a separate editor: writers run in parallel
+(writing N slides takes roughly the time of the slowest single
+slide, not N times as long) and each one stays strictly on its
+brief, but no single writer can see the whole story. The editor is
+the agent that can — it reorders, cuts duplicates, and smooths
+transitions. Results are collected by slide number, not finish
+order, so the deck never scrambles; if one slide's LLM call fails,
+that slide falls back to its brief (key points as bullets) instead
+of killing the whole deck.
 
 Why LaTeX is rendered, not generated: an LLM writing raw LaTeX is
 where decks break (unescaped `%`, missing `\end{frame}`). The deck
@@ -88,44 +92,6 @@ python main.py --topic "Google Gemini" --author "Harikrishna Dev" \
 Output in the `--out` folder: `presentation.tex`, `deck.json`,
 `outline.json`, `review.json`, and `presentation.pdf` if a LaTeX
 engine (`tectonic` or `pdflatex`) is installed.
-
-## Editing a deck with your comments
-
-```bash
-# Edit an existing deck — no slide is regenerated from scratch.
-# The Flow Editor applies each comment, then the deck is re-rendered
-# and re-compiled.
-python main.py --edit out/gemini/deck.json --outline out/gemini/outline.json \
-  --comments $'Slide 5: shorten the bullets to one line each\nDrop slide 12, it repeats slide 9' \
-  --out out/gemini-v2
-
-# Or apply comments on a fresh build (same flags work on run_a2a.py too).
-python main.py --topic "Google Gemini" --slides 6 \
-  --comments "overall: keep every bullet under 12 words" --out out/gemini
-```
-
-Comments are one per line, optionally aimed at a slide
-(`Slide 5: ...`, `overall: ...`); a JSON file works too
-(`--comments-file comments.json`, `{"comments": [{"slide": 5, "comment": "..."}]}`).
-A comment can rewrite, shorten, or drop a slide, or ask to
-`add a slide about X` — the new slide is written before the ending slide.
-
-## Building a deck from a source
-
-```bash
-# From a PDF — every slide is grounded in the document, not invented.
-python main.py --source ~/Downloads/paper.pdf --slides 10 --out out/paper
-
-# From a public GitHub repo (shallow-cloned: README + docs + file tree)
-# or a local folder/repo — topic defaults to the repo name.
-python main.py --source https://github.com/harikrishnad1997/Multi-agent-Presentation-Generator --slides 10 --out out/repo-deck
-```
-
-Sources: `.pdf`, `.txt`/`.md`, a local folder, or a public GitHub
-repo URL. The source text (capped at ~12k chars, README/docs first)
-goes to the Planner and to each Writer with one hard rule: base every
-bullet on a fact in the source, never invent one. For a private repo,
-clone it locally and pass the folder. Same flags work on `run_a2a.py`.
 
 ## Tracing (Opik)
 
@@ -160,7 +126,14 @@ tool-calling, so it works identically on both backends.
 ## Layout
 
 - `main.py` — CLI
+- `run_a2a.py` — CLI for the A2A transport (starts the five agent servers)
 - `src/presentation_generator/graph.py` — LangGraph pipeline + agents
+- `src/presentation_generator/graph_a2a.py` — same pipeline over A2A
+- `src/presentation_generator/a2a_agents.py` — the five A2A agents
+- `src/presentation_generator/a2a_client.py` — A2A client (Card → message/send → artifact)
+- `src/presentation_generator/a2a_server.py` — A2A server entry point
 - `src/presentation_generator/llm.py` — GPT backends (ChatOpenAI / helper)
 - `src/presentation_generator/models.py` — Pydantic schemas agents speak
 - `src/presentation_generator/latex_utils.py` — Beamer rendering + validation
+- `src/presentation_generator/charts.py` — deterministic matplotlib charts
+- `src/presentation_generator/tracing.py` — Opik tracing (no-op without a key)
