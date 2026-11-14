@@ -196,7 +196,7 @@ def research_topic(topic: str, model: str | None = None, shallow: bool = False) 
                 continue
             domain = urllib.parse.urlparse(url).netloc
             excerpts.append(f"--- {title} ({domain}) ---\n{url}\n{text}")
-            sources.append(f"{domain} — {title[:60]}")
+            sources.append(f"{title[:100]} — {url}")
     # Wikipedia base: definitions and dates even when the open web is thin.
     try:
         found = ground_topic(topic)

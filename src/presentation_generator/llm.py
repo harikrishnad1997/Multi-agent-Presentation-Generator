@@ -21,6 +21,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextvars import ContextVar
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,17 @@ HELPER_PATH = Path(
         Path.home() / "workspace/custom-connectors/custom.openai/bin/openai_chat.py",
     )
 )
+_REQUEST_API_KEY: ContextVar[str | None] = ContextVar("presentation_request_api_key", default=None)
+
+
+@contextmanager
+def use_api_key(api_key: str | None):
+    """Use a per-job API key without changing the process environment."""
+    token = _REQUEST_API_KEY.set(api_key.strip() if api_key and api_key.strip() else None)
+    try:
+        yield
+    finally:
+        _REQUEST_API_KEY.reset(token)
 
 
 class HelperChatModel(BaseChatModel):
@@ -79,10 +92,11 @@ class HelperChatModel(BaseChatModel):
 def get_llm(model: str | None = None) -> BaseChatModel:
     """Return a LangChain chat model for the given model name."""
     name = model or DEFAULT_MODEL
-    if os.environ.get("OPENAI_API_KEY"):
+    api_key = _REQUEST_API_KEY.get() or os.environ.get("OPENAI_API_KEY")
+    if api_key:
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=name, temperature=0.7)
+        return ChatOpenAI(model=name, temperature=0.7, api_key=api_key)
     if HELPER_PATH.is_file():
         return HelperChatModel(model=name)
     raise RuntimeError(

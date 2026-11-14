@@ -52,6 +52,8 @@ class SlideContent(BaseModel):
     notes: str = Field(default="", description="Speaker notes, 1-3 sentences, plain text.")
     chart: ChartSpec | None = None
     chart_file: str | None = None  # set by the chart renderer, e.g. charts/slide_03.png
+    image_file: str | None = None
+    image_source: str | None = None  # attribution/link for the sourced image
 
 
 class Deck(BaseModel):

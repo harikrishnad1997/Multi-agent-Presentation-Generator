@@ -75,7 +75,7 @@ def format_comments(comments: list[dict]) -> str:
 
 
 def apply_comments(deck: Deck, outline: Outline, comments: list[dict],
-                   model: str | None, topic: str = "") -> Deck:
+                   model: str | None, topic: str = "", source_material: str = "") -> Deck:
     """Apply user comments via the Flow Editor, with add/drop support.
 
     Order matters, learned from a bad test run: slide numbers are
@@ -166,6 +166,7 @@ def apply_comments(deck: Deck, outline: Outline, comments: list[dict],
         review_issues=f"User comments — apply every one that names a slide in this chunk, and every whole-deck comment:\n{text}",
         topic=topic or deck.title,
         num_slides=len(slides),
+        source_material=source_material,
     )
     # 5) A dropped slide must stay dropped even if the editor's fill
     # re-added a slide with the same title.
@@ -180,7 +181,7 @@ def apply_comments(deck: Deck, outline: Outline, comments: list[dict],
 
 def edit_deck_file(deck_path: str, outline_path: str | None = None, comments: str = "",
                    model: str | None = None, author: str = "", institute: str = "",
-                   output_dir: str = "out") -> dict:
+                   output_dir: str = "out", source_material: str = "") -> dict:
     """Edit an existing deck file in place (no slide regenerated from
     scratch): load deck.json (+ outline.json if present), apply the
     user's comments, re-render charts + LaTeX, review once, compile.
@@ -200,7 +201,8 @@ def edit_deck_file(deck_path: str, outline_path: str | None = None, comments: st
             slides=[SlideBrief(number=s.number, title=s.title, brief="", key_points=list(s.bullets))
                     for s in deck.slides],
         )
-    edited = apply_comments(deck, outline, parse_comments(text=comments), model, topic=deck.title)
+    edited = apply_comments(deck, outline, parse_comments(text=comments), model,
+                            topic=deck.title, source_material=source_material)
     edited, chart_count = render_deck_charts(edited, output_dir)
     latex = render_beamer(edited, author, institute)
     review = review_deck(edited, latex, chart_count, model)

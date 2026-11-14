@@ -1,4 +1,4 @@
-"""LangGraph pipeline: planner -> parallel slide writers -> flow editor -> LaTeX -> reviewer -> compiler.
+"""LangGraph pipeline: planner -> parallel slide writers -> flow editor -> visuals -> LaTeX -> reviewer -> compiler.
 
 Flow, in one paragraph: the Planner turns a topic into a structured
 outline (one brief per slide). LangGraph ``Send`` fans those briefs
@@ -17,6 +17,10 @@ the Planner — a fresh outline, fresh slides — with the reviewer's
 findings fed in as feedback, instead of patching the failed deck in
 place. Up to 3 full attempts; if the last one still fails, its deck
 is compiled as-is with the failing review recorded honestly.
+
+When image sourcing is enabled, a dedicated image agent checks the
+topic article's images against slide content before any image is
+downloaded or attached.
 
 
 GPT is the LLM throughout (default gpt-4o-mini, overridable with
@@ -37,6 +41,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from .charts import render_chart, validate_chart
+from .images import find_article_images, render_selected_images
 from .latex_utils import render_beamer, validate_latex
 from .llm import get_llm
 from .models import ChartSpec, Deck, Outline, ReviewIssue, ReviewResult, SlideBrief, SlideContent
@@ -62,8 +67,15 @@ class PresentationState(TypedDict, total=False):
     pdf_path: str | None
     compile_log: str
     charts_enabled: bool
+    images_enabled: bool
+    image_article_title: str
+    image_article_url: str
+    image_candidates: list[dict]
+    image_selections: list[dict]
     chart_count: int
+    image_count: int
     source_text: str
+    references: list[str]
     comments: str
     # Per-branch Send payload for write_slide:
     brief: dict
@@ -394,7 +406,7 @@ def _slide_text(s: SlideContent) -> str:
     return text
 
 
-def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, review_issues: str = "", topic: str = "", num_slides: int | None = None) -> Deck:
+def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, review_issues: str = "", topic: str = "", num_slides: int | None = None, source_material: str = "") -> Deck:
     """Edit a deck in order; fix flow, duplication, ordering, tone.
 
     Chunked in groups of 6 slides: a 30-slide deck regenerated in one
@@ -419,7 +431,9 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         "Your jobs: (1) cut or rewrite any point duplicated within the chunk or with the neighbouring slides; "
         "(2) add a transition where a jump feels abrupt — fold it into the next slide's first bullet or its notes; "
         "(3) even out tone and bullet length; (4) every slide keeps 3-5 bullets and 1-3 sentences of notes; "
-        "(5) preserve each chart exactly as given unless its numbers duplicate another chart — never invent new chart data. "
+        "(5) preserve each chart exactly by default, but obey an explicit user request to change a chart's type, title, labels, or placement. "
+        "Never invent or alter numeric values unless the user supplied them in the request or source material; "
+        "when a requested trend needs missing time-series values, keep the existing values and say what data is needed. "
         "Return the full edited chunk, not just the changes."
     )
     edited: list[SlideContent] = []
@@ -437,6 +451,10 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         user = f"Presentation: {outline.title}\nStyle: {outline.style_guide}\n" + "\n\n".join(neighbours) + f"\n\n{chunk_text}"
         if issues:
             user += f"\n\nReviewer issues from the previous round — fix all that apply to this chunk:\n{issues}"
+        if source_material:
+            user += ("\n\nAdditional source material supplied for this revision. Apply it only to the slide(s) "
+                     "targeted by the user's comments. Ground factual changes in this material and do not "
+                     "invent facts:\n" + source_material)
         try:
             fragment = Deck.model_validate(_chat_json(llm, system, user))
             edited.extend(fragment.slides)
@@ -564,6 +582,63 @@ def render_charts(state: PresentationState) -> dict:
     return {"deck": deck.model_dump(), "chart_count": count}
 
 
+def image_agent(state: PresentationState) -> dict:
+    """Find topic-article images and let the image agent match them to slides."""
+    if not state.get("images_enabled", False):
+        return {"image_candidates": [], "image_selections": [], "image_count": 0}
+    try:
+        article_title, article_url, candidates = find_article_images(state.get("topic", ""))
+    except Exception:
+        article_title, article_url, candidates = "", "", []
+    if not candidates:
+        return {
+            "image_article_title": article_title, "image_article_url": article_url,
+            "image_candidates": [], "image_selections": [], "image_count": 0,
+        }
+    from .image_agent import select_relevant_images
+
+    selections = select_relevant_images(state["deck"], candidates, state.get("model"))
+    return {
+        "image_article_title": article_title, "image_article_url": article_url,
+        "image_candidates": candidates, "image_selections": selections,
+    }
+
+
+def render_images(state: PresentationState) -> dict:
+    """Download only slide/image assignments selected by the image agent."""
+    deck = Deck.model_validate(state["deck"])
+    deck, count = render_selected_images(
+        deck, state.get("output_dir") or "out",
+        state.get("image_article_title", ""), state.get("image_article_url", ""),
+        state.get("image_candidates", []), state.get("image_selections", []),
+    )
+    return {"deck": deck.model_dump(), "image_count": count}
+
+
+def add_references(state: PresentationState) -> dict:
+    """Append a references slide, including research, supplied, and image sources."""
+    deck = Deck.model_validate(state["deck"])
+    refs = list(state.get("references", []))
+    for slide in deck.slides:
+        if slide.image_source:
+            refs.append(slide.image_source)
+    # Stable dedupe while retaining the source order.
+    refs = list(dict.fromkeys(ref.strip() for ref in refs if ref.strip()))
+    if not refs:
+        refs = ["No external sources supplied; content generated from model knowledge."]
+    deck.slides = [s for s in deck.slides if not s.title.strip().lower().startswith("references")]
+    # Keep each citation frame short enough to fit while preserving every source.
+    for chunk_index, start in enumerate(range(0, len(refs), 4)):
+        title = "References" if chunk_index == 0 else f"References (continued {chunk_index + 1})"
+        deck.slides.append(SlideContent(
+            number=len(deck.slides) + 1,
+            title=title,
+            bullets=refs[start:start + 4],
+            notes="Sources used to prepare this presentation.",
+        ))
+    return {"deck": deck.model_dump()}
+
+
 # ------------------------------------------------------------------- latex
 def render_latex(state: PresentationState) -> dict:
     deck = Deck.model_validate(state["deck"])
@@ -581,6 +656,7 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None) -> 
         "You review a presentation deck and its LaTeX. Output JSON only. "
         "Schema: {\"passed\": bool, \"issues\": [{\"severity\": str, \"slide\": int|null, \"issue\": str, \"fix\": str}], \"summary\": str}. "
         "Check: each slide has 3-5 bullets, notes present, no duplicated points, titles match content, "
+        "except References slides, which list citations; preserve every citation exactly. "
         "no factual howlers, no empty slides. Severity is one of critical, major, minor. "
         "Use critical ONLY for duplicated content, empty slides, wrong titles, or invalid LaTeX/charts. "
         "'Lacks detail' or 'lacks timelines' is major at most, never critical. "
@@ -685,6 +761,9 @@ def build_graph():
     builder.add_node("write_slide", write_slide)
     builder.add_node("editor", editor)
     builder.add_node("render_charts", render_charts)
+    builder.add_node("image_agent", image_agent)
+    builder.add_node("render_images", render_images)
+    builder.add_node("add_references", add_references)
     builder.add_node("render_latex", render_latex)
     builder.add_node("reviewer", reviewer)
     builder.add_node("compile", compile_output)
@@ -693,7 +772,10 @@ def build_graph():
     builder.add_conditional_edges("planner", route_planner)
     builder.add_edge("write_slide", "editor")
     builder.add_edge("editor", "render_charts")
-    builder.add_edge("render_charts", "render_latex")
+    builder.add_edge("render_charts", "image_agent")
+    builder.add_edge("image_agent", "render_images")
+    builder.add_edge("render_images", "add_references")
+    builder.add_edge("add_references", "render_latex")
     builder.add_edge("render_latex", "reviewer")
     builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
@@ -703,11 +785,13 @@ def build_graph():
 def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         model: str | None = None, output_dir: str = "out", charts_enabled: bool = True,
         source_text: str = "", comments: str = "", search: bool = True,
-        shallow: bool = False) -> dict:
+        shallow: bool = False, images_enabled: bool = False,
+        references: list[str] | None = None) -> dict:
     from .tracing import flush, get_callbacks
 
     graph = build_graph()
     grounding = {"mode": "source", "sources": []}
+    source_references = list(references or [])
     if not source_text and search:
         # No --source: research first, then the deck. research_topic
         # plans sub-queries, searches the web, fetches pages, and
@@ -719,6 +803,7 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         if found.brief:
             source_text = found.brief
             grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}
+            source_references.extend(found.sources)
         else:
             grounding = {"mode": "none", "sources": []}
     elif not source_text:
@@ -734,8 +819,10 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         "attempts": 0,
         "build_attempt": 0,
         "charts_enabled": charts_enabled,
+        "images_enabled": images_enabled,
         "chart_count": 0,
         "source_text": source_text,
+        "references": source_references,
         "comments": comments,
     }
     try:

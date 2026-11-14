@@ -23,6 +23,7 @@ from .graph import (
     MAX_ATTEMPTS,
     PresentationState,
     compile_output,
+    add_references,
     render_latex,
     route_reviewer,
 )
@@ -116,6 +117,7 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_node("write_slide", write_slide)
     builder.add_node("editor", editor)
     builder.add_node("render_charts", render_charts)
+    builder.add_node("add_references", add_references)
     builder.add_node("render_latex", render_latex)
     builder.add_node("reviewer", reviewer)
     builder.add_node("compile", compile_output)
@@ -124,7 +126,8 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_conditional_edges("planner", route_planner)
     builder.add_edge("write_slide", "editor")
     builder.add_edge("editor", "render_charts")
-    builder.add_edge("render_charts", "render_latex")
+    builder.add_edge("render_charts", "add_references")
+    builder.add_edge("add_references", "render_latex")
     builder.add_edge("render_latex", "reviewer")
     builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
@@ -139,6 +142,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
     from .tracing import flush, get_callbacks
 
     grounding = {"mode": "source", "sources": []}
+    references: list[str] = []
     if not source_text and search:
         from .research import research_topic
 
@@ -146,6 +150,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
         if found.brief:
             source_text = found.brief
             grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}
+            references.extend(found.sources)
         else:
             grounding = {"mode": "none", "sources": []}
     elif not source_text:
@@ -156,7 +161,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
         "topic": topic, "author": author, "institute": institute,
         "num_slides": num_slides, "model": model or "", "output_dir": output_dir,
         "slides": [], "attempts": 0, "build_attempt": 0, "charts_enabled": charts_enabled, "chart_count": 0,
-        "source_text": source_text, "comments": comments,
+        "source_text": source_text, "comments": comments, "references": references,
     }
     try:
         # Same OpikTracer callback as the in-process run: it traces the

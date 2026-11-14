@@ -40,6 +40,7 @@ def main() -> int:
     ap.add_argument("--model", default=None, help="GPT model, default gpt-4o-mini (or OPENAI_MODEL)")
     ap.add_argument("--out", default="out", help="Output directory")
     ap.add_argument("--no-charts", action="store_true", help="Disable visuals/graphs")
+    ap.add_argument("--images", action="store_true", help="Select relevant, licensed images from the topic's Wikipedia article")
     ap.add_argument("--no-search", action="store_true", help="Skip grounding entirely (deck is from model knowledge only)")
     ap.add_argument("--shallow", action="store_true", help="Skip deep research; use the quick Wikipedia-only grounding instead")
     args = ap.parse_args()
@@ -78,11 +79,13 @@ def main() -> int:
         return 0
 
     source_text = ""
+    references = []
     topic = args.topic
     if args.source:
         source = load_source(args.source)
         print(f"Source: {source.kind} — {source.ref} ({len(source.text)} chars)")
         source_text = source.text
+        references.append(source.ref)
         topic = topic or source.title
     if not topic:
         print("--topic is required (or pass --source so the topic comes from the source).")
@@ -91,7 +94,7 @@ def main() -> int:
     started = time.time()
     print(f"Topic: {topic}  |  slides: {args.slides}  |  charts: {'off' if args.no_charts else 'on (~1 in 3 slides)'}  |  model: {args.model or 'gpt-4o-mini (default)'}")
     print(status_line())
-    print("Agents: planner -> parallel slide writers -> flow editor -> charts -> LaTeX -> reviewer -> compiler")
+    print("Agents: planner -> parallel slide writers -> flow editor -> charts -> image selector -> LaTeX -> reviewer -> compiler")
     result = run(
         topic=topic,
         author=args.author,
@@ -104,6 +107,8 @@ def main() -> int:
         comments=comments,
         search=not args.no_search,
         shallow=args.shallow,
+        images_enabled=args.images,
+        references=references,
     )
     elapsed = time.time() - started
     deck = result.get("deck", {})

@@ -26,6 +26,8 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
+from contextvars import ContextVar
+from contextlib import contextmanager
 
 # Workspace pinned in code: traces go to the "harikrishnad1997"
 # workspace unless OPIK_WORKSPACE is explicitly set in the
@@ -33,6 +35,20 @@ import os
 os.environ.setdefault("OPIK_WORKSPACE", "harikrishnad1997")
 _PROJECT = os.environ.get("OPIK_PROJECT_NAME", "multi-agent-presentation-generator")
 _import_ok = None
+_REQUEST_OPIK_KEY: ContextVar[str | None] = ContextVar("presentation_request_opik_key", default=None)
+_REQUEST_OPIK_CLIENT: ContextVar[object | None] = ContextVar("presentation_request_opik_client", default=None)
+
+
+@contextmanager
+def use_opik_api_key(api_key: str | None):
+    """Set a tracing key for one generation without changing process env."""
+    token = _REQUEST_OPIK_KEY.set(api_key.strip() if api_key and api_key.strip() else None)
+    client_token = _REQUEST_OPIK_CLIENT.set(None)
+    try:
+        yield
+    finally:
+        _REQUEST_OPIK_CLIENT.reset(client_token)
+        _REQUEST_OPIK_KEY.reset(token)
 
 
 def _opik():
@@ -50,7 +66,7 @@ def _opik():
 def enabled() -> bool:
     if os.environ.get("PRESENTATION_OPIK", "").lower() in ("off", "0", "no"):
         return False
-    return bool(os.environ.get("OPIK_API_KEY")) and _opik()
+    return bool(_REQUEST_OPIK_KEY.get() or os.environ.get("OPIK_API_KEY")) and _opik()
 
 
 def project_name() -> str:
@@ -61,7 +77,7 @@ def status():
     """(enabled, workspace label, project) — the workspace label shows
     exactly where traces will land, so a wrong-workspace key is visible
     instead of silent."""
-    ws = os.environ.get("OPIK_WORKSPACE") or "(key's default — not set)"
+    ws = os.environ.get("OPIK_WORKSPACE") or "harikrishnad1997"
     return enabled(), ws, _PROJECT
 
 
@@ -78,9 +94,23 @@ def get_callbacks() -> list:
     if not enabled():
         return []
     try:
+        import opik
         from opik.integrations.langchain import OpikTracer
 
-        return [OpikTracer(project_name=_PROJECT)]
+        api_key = _REQUEST_OPIK_KEY.get() or os.environ.get("OPIK_API_KEY")
+        client = opik.Opik(
+            project_name=_PROJECT,
+            workspace=os.environ.get("OPIK_WORKSPACE") or "harikrishnad1997",
+            api_key=api_key,
+        )
+        _REQUEST_OPIK_CLIENT.set(client)
+
+        class RequestOpikTracer(OpikTracer):
+            @property
+            def _opik_client(self):
+                return client
+
+        return [RequestOpikTracer(project_name=_PROJECT)]
     except Exception:
         return []
 
@@ -146,6 +176,10 @@ def flush():
     if not enabled():
         return
     try:
+        client = _REQUEST_OPIK_CLIENT.get()
+        if client is not None:
+            client.flush()
+            return
         import opik
 
         opik.flush_tracker()
