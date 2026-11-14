@@ -10,6 +10,12 @@ output, which rewrote the `\n` inside `\note{...}` into a newline +
 `ote{...}`. This version never does string-level newline replacement
 on LaTeX — see `latex_utils.py`.
 
+## Example output
+
+- [Google Gemini, 30 slides, 8 charts (PDF)](examples/google-gemini-30-slides.pdf) —
+  built by the A2A run (`run_a2a.py --topic "Google Gemini" --slides 30`):
+  30 slides, 8 charts, review passed round 1.
+
 ## Flow
 
 ```
