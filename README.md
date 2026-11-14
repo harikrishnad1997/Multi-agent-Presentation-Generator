@@ -12,9 +12,9 @@ on LaTeX — see `latex_utils.py`.
 
 ## Example output
 
-- [Google Gemini, 30 slides, 8 charts (PDF)](examples/google-gemini-30-slides.pdf) —
-  built by the A2A run (`run_a2a.py --topic "Google Gemini" --slides 30`):
-  30 slides, 8 charts, review passed round 1.
+- [A2A Agent Protocol, 30 slides, 9 charts (PDF)](examples/a2a-agent-protocol-30-slides.pdf) —
+  built by the A2A run (`run_a2a.py --topic "A2A Agent Protocol (Google Agent2Agent)" --slides 30`):
+  30 slides, 9 charts (the full 9/9 visuals), review passed round 1.
 
 ## Flow
 
@@ -88,6 +88,44 @@ python main.py --topic "Google Gemini" --author "Harikrishna Dev" \
 Output in the `--out` folder: `presentation.tex`, `deck.json`,
 `outline.json`, `review.json`, and `presentation.pdf` if a LaTeX
 engine (`tectonic` or `pdflatex`) is installed.
+
+## Editing a deck with your comments
+
+```bash
+# Edit an existing deck — no slide is regenerated from scratch.
+# The Flow Editor applies each comment, then the deck is re-rendered
+# and re-compiled.
+python main.py --edit out/gemini/deck.json --outline out/gemini/outline.json \
+  --comments $'Slide 5: shorten the bullets to one line each\nDrop slide 12, it repeats slide 9' \
+  --out out/gemini-v2
+
+# Or apply comments on a fresh build (same flags work on run_a2a.py too).
+python main.py --topic "Google Gemini" --slides 6 \
+  --comments "overall: keep every bullet under 12 words" --out out/gemini
+```
+
+Comments are one per line, optionally aimed at a slide
+(`Slide 5: ...`, `overall: ...`); a JSON file works too
+(`--comments-file comments.json`, `{"comments": [{"slide": 5, "comment": "..."}]}`).
+A comment can rewrite, shorten, or drop a slide, or ask to
+`add a slide about X` — the new slide is written before the ending slide.
+
+## Building a deck from a source
+
+```bash
+# From a PDF — every slide is grounded in the document, not invented.
+python main.py --source ~/Downloads/paper.pdf --slides 10 --out out/paper
+
+# From a public GitHub repo (shallow-cloned: README + docs + file tree)
+# or a local folder/repo — topic defaults to the repo name.
+python main.py --source https://github.com/harikrishnad1997/Multi-agent-Presentation-Generator --slides 10 --out out/repo-deck
+```
+
+Sources: `.pdf`, `.txt`/`.md`, a local folder, or a public GitHub
+repo URL. The source text (capped at ~12k chars, README/docs first)
+goes to the Planner and to each Writer with one hard rule: base every
+bullet on a fact in the source, never invent one. For a private repo,
+clone it locally and pass the folder. Same flags work on `run_a2a.py`.
 
 ## Tracing (Opik)
 
