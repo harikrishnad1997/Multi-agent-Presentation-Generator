@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from presentation_generator.graph import run  # noqa: E402
+from presentation_generator.tracing import status_line  # noqa: E402
 
 
 def main() -> int:
@@ -36,6 +37,7 @@ def main() -> int:
 
     started = time.time()
     print(f"Topic: {args.topic}  |  slides: {args.slides}  |  charts: {'off' if args.no_charts else 'on (~1 in 3 slides)'}  |  model: {args.model or 'gpt-4o-mini (default)'}")
+    print(status_line())
     print("Agents: planner -> parallel slide writers -> flow editor -> charts -> LaTeX -> reviewer -> compiler")
     result = run(
         topic=args.topic,

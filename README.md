@@ -89,6 +89,21 @@ Output in the `--out` folder: `presentation.tex`, `deck.json`,
 `outline.json`, `review.json`, and `presentation.pdf` if a LaTeX
 engine (`tectonic` or `pdflatex`) is installed.
 
+## Tracing (Opik)
+
+One Opik trace per deck build — project `multi-agent-presentation-generator`,
+workspace `harikrishnad1997` (see `src/presentation_generator/tracing.py`,
+same pattern as Reel Chat). The LangChain `OpikTracer` callback traces
+every LLM call and LangGraph node in both the in-process and A2A runs,
+and each A2A agent also records its own span server-side.
+
+Tracing is on when `OPIK_API_KEY` is set (`PRESENTATION_OPIK=off` to
+disable it); without a key it is a strict no-op and a deck build is
+never affected. Tracing failures can never break a build — everything
+fails soft. The project is created automatically when the first trace
+lands. `opik` is pinned to `==2.2.138` (a newer unpinned Opik rejected
+the `llm` span type at import and crashed Reel Chat in Nov 2026).
+
 ## LLM — GPT
 
 Default model is `gpt-4o-mini` (`--model` / `OPENAI_MODEL` to change).

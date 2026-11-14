@@ -6,3 +6,4 @@ matplotlib==3.11.2
 a2a-sdk==0.3.26
 uvicorn
 httpx
+opik==2.2.138

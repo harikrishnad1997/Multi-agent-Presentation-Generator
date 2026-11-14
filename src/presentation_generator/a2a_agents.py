@@ -37,6 +37,7 @@ from a2a.types import (
 )
 
 from .graph import edit_deck, plan_outline, render_deck_charts, review_deck, write_one_slide
+from .tracing import span as opik_span
 from .latex_utils import render_beamer
 from .models import Deck, Outline, SlideBrief, SlideContent
 
@@ -74,13 +75,18 @@ class _JsonAgent(AgentExecutor):
     """Base: parse JSON input, run blocking work in a thread, reply with a JSON artifact."""
 
     artifact_name = "result"
+    agent_name = "agent"
 
     def run(self, payload: dict) -> dict:
         raise NotImplementedError
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         payload = _payload(context)
-        result = await asyncio.to_thread(self.run, payload)
+        # Opik span per agent call (no-op without OPIK_API_KEY; small
+        # metadata only — never the full payload). Runs inside the
+        # thread with the work, so the span covers the LLM call.
+        with opik_span(f"presentation-{self.agent_name}", metadata={"agent": self.agent_name}):
+            result = await asyncio.to_thread(self.run, payload)
         await _finish(event_queue, context, result, self.artifact_name)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
@@ -98,6 +104,7 @@ class _JsonAgent(AgentExecutor):
 
 
 class PlannerAgent(_JsonAgent):
+    agent_name = "planner"
     artifact_name = "outline"
 
     def run(self, payload: dict) -> dict:
@@ -109,6 +116,7 @@ class PlannerAgent(_JsonAgent):
 
 
 class WriterAgent(_JsonAgent):
+    agent_name = "writer"
     artifact_name = "slide"
 
     def run(self, payload: dict) -> dict:
@@ -122,6 +130,7 @@ class WriterAgent(_JsonAgent):
 
 
 class EditorAgent(_JsonAgent):
+    agent_name = "editor"
     artifact_name = "deck"
 
     def run(self, payload: dict) -> dict:
@@ -137,6 +146,7 @@ class EditorAgent(_JsonAgent):
 
 
 class ChartAgent(_JsonAgent):
+    agent_name = "chart"
     artifact_name = "charts"
 
     def run(self, payload: dict) -> dict:
@@ -146,6 +156,7 @@ class ChartAgent(_JsonAgent):
 
 
 class ReviewerAgent(_JsonAgent):
+    agent_name = "reviewer"
     artifact_name = "review"
 
     def run(self, payload: dict) -> dict:

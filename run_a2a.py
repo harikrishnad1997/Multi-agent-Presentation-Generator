@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from presentation_generator.a2a_agents import AGENT_CLASSES, PORTS  # noqa: E402
 from presentation_generator.graph_a2a import run_a2a  # noqa: E402
+from presentation_generator.tracing import status_line  # noqa: E402
 
 
 def _wait_for_card(port: int, timeout: float = 60) -> bool:
@@ -69,6 +70,7 @@ def main() -> int:
                 return 1
             print(f"  card OK: http://127.0.0.1:{port}/.well-known/agent-card.json")
         print(f"\nTopic: {args.topic}  |  slides: {args.slides}  |  charts: {'off' if args.no_charts else 'on'}  |  transport: A2A")
+        print(status_line())
         started = time.time()
         result = run_a2a(
             topic=args.topic, author=args.author, institute=args.institute,

@@ -124,10 +124,18 @@ def make_a2a_graph(urls: dict | None = None):
 def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
             model: str | None = None, output_dir: str = "out",
             charts_enabled: bool = True, urls: dict | None = None) -> dict:
+    from .tracing import flush, get_callbacks
+
     graph = make_a2a_graph(urls)
     initial: PresentationState = {
         "topic": topic, "author": author, "institute": institute,
         "num_slides": num_slides, "model": model or "", "output_dir": output_dir,
         "slides": [], "attempts": 0, "charts_enabled": charts_enabled, "chart_count": 0,
     }
-    return graph.invoke(initial)
+    try:
+        # Same OpikTracer callback as the in-process run: it traces the
+        # orchestrator's nodes and LLM calls. Each A2A agent also traces
+        # its own span server-side (see a2a_agents._JsonAgent).
+        return graph.invoke(initial, config={"callbacks": get_callbacks()})
+    finally:
+        flush()

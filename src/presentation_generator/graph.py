@@ -599,6 +599,8 @@ def build_graph():
 
 def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         model: str | None = None, output_dir: str = "out", charts_enabled: bool = True) -> dict:
+    from .tracing import flush, get_callbacks
+
     graph = build_graph()
     initial: PresentationState = {
         "topic": topic,
@@ -612,4 +614,9 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         "charts_enabled": charts_enabled,
         "chart_count": 0,
     }
-    return graph.invoke(initial)
+    try:
+        # OpikTracer callback traces every LLM call and LangGraph node
+        # when OPIK_API_KEY is set; empty list (no-op) otherwise.
+        return graph.invoke(initial, config={"callbacks": get_callbacks()})
+    finally:
+        flush()
