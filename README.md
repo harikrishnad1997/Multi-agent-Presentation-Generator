@@ -114,6 +114,101 @@ When a source is provided, its contents are used for grounding and the topic res
 
 Run `python main.py --help` or `python run_a2a.py --help` for the full command-line help.
 
+### FastAPI server for a UI
+
+Start the API from the project root:
+
+```bash
+python -m pip install -r requirements.txt
+python serve.py
+```
+
+### Streamlit presentation studio
+
+Start the API in one terminal, then start the Streamlit interface in another:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI uses `http://localhost:8000` by default. Set `PRESENTATION_API_URL`
+to point it at a different API host. It supports topic generation, PDF/TXT/MD
+source uploads, chat-based revisions with conversation context, and PDF preview
+and download when the API host has `tectonic` or `pdflatex` installed. The
+generator produces Beamer source and an optional PDF; it does not currently
+produce a `.pptx` file.
+
+The interactive API reference is at `http://localhost:8000/docs`. A UI can
+submit a build with `POST /api/generations`, poll `GET /api/generations/{id}`,
+then fetch the deck and artifact list from `GET /api/generations/{id}/result`.
+Download files such as `deck.json`, `presentation.pdf`, or chart PNGs from
+`GET /api/generations/{id}/artifacts/{path}`. Generation is asynchronous and
+returns HTTP 202 with the job ID and status URL.
+
+Example request:
+
+```json
+{
+  "topic": "Google Gemini",
+  "author": "Your Name",
+  "institute": "Your Organization",
+  "slides": 6,
+  "charts": true,
+  "search": true
+}
+```
+
+To revise a completed deck, post to `POST /api/generations/{id}/edits`. The
+body accepts `comments` and optional `source_text` (up to 12,000 characters),
+or `source` for a local path or public GitHub repository. For example:
+
+```json
+{
+  "comments": "Slide 3: update the market-size figures using the supplied source",
+  "source_text": "Paste the source excerpt or extracted document text here."
+}
+```
+
+The edit returns a new job ID and keeps the original generation unchanged. Poll
+and fetch its result and artifacts through the same status, result, and artifact
+routes. Comments can target slides, request additions or removals, or make
+overall changes. Source material is provided to the editor with instructions to
+apply it to the targeted slide(s).
+
+Browser clients can upload a PDF, TXT, or Markdown file directly with
+`multipart/form-data`: use `POST /api/generations/upload` with a `file` field
+and optional generation fields, or `POST /api/generations/{id}/edits/upload`
+with `file` and `comments` fields. Uploads are limited to 20 MB and extracted
+source text is capped by the existing source loader.
+
+The generated presentation format is Beamer LaTeX with an optional compiled
+PDF; this server does not currently emit a PowerPoint `.pptx` file.
+
+Set `PRESENTATION_CORS_ORIGINS` to a comma-separated list of UI origins when
+the frontend runs on a different origin (defaults allow localhost ports 3000
+and 5173). `PRESENTATION_OUTPUT_DIR` changes the artifact directory, and
+`PRESENTATION_API_WORKERS` controls concurrent generation jobs. Jobs are held
+in memory, so their status is lost when the server restarts; generated files
+remain in the output directory.
+
+### Run with Docker
+
+Build and start the API, persisting generated files in the local `out` folder:
+
+```bash
+docker build -t presentation-generator .
+docker run --rm -p 8000:8000 \
+  -e OPENAI_API_KEY \
+  -v "$(pwd)/out:/app/out" \
+  presentation-generator
+```
+
+Open `http://localhost:8000/docs` to use the API. Set `OPENAI_MODEL`,
+`PRESENTATION_CORS_ORIGINS`, or other supported environment variables with
+additional `-e NAME=value` options. If your machine uses the Muse credential
+helper instead of `OPENAI_API_KEY`, provide the key through the environment;
+the helper itself is not included in the image.
+
 ## Configuration
 
 The default model is `gpt-4o-mini`. Set `OPENAI_API_KEY` to use the OpenAI API, or set `OPENAI_MODEL` to choose a different default model. The application also supports the Muse secure OpenAI connector helper when available.
@@ -121,6 +216,27 @@ The default model is `gpt-4o-mini`. Set `OPENAI_API_KEY` to use the OpenAI API, 
 Optional Opik tracing is enabled when `OPIK_API_KEY` is set. Set `PRESENTATION_OPIK=off` to disable tracing. Without an Opik key, tracing is a no-op and does not affect deck generation.
 
 ## How it works
+
+```mermaid
+flowchart TD
+    I[Topic or source] --> G{Grounding enabled?}
+    G -->|Topic research| R[Research brief]
+    G -->|Source supplied| S[Load source content]
+    G -->|Disabled| P[Planner]
+    R --> P
+    S --> P
+    P -->|One brief per slide| W1[Slide writer 1]
+    P --> W2[Slide writer 2]
+    P --> WN[Slide writer N]
+    W1 --> E[Flow editor]
+    W2 --> E
+    WN --> E
+    E --> C[Render charts]
+    C --> L[Render Beamer LaTeX]
+    L --> V[Review deck and LaTeX]
+    V -->|Passed or retry limit reached| O[Write JSON and TeX; compile PDF if available]
+    V -->|Critical issues and retries remain| P
+```
 
 1. **Research** gathers topic information and prepares a research brief, unless grounding is disabled or a source is supplied.
 2. **Planner** creates a structured outline with a brief for each slide.

@@ -5,6 +5,11 @@ pydantic==2.14.3
 matplotlib==3.11.2
 a2a-sdk==0.3.26
 uvicorn
+fastapi
+python-multipart
 httpx
+streamlit
+requests
 opik==2.2.138
 pypdf==7.1.0
+text-unidecode==1.3

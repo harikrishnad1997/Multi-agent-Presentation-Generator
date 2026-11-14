@@ -139,7 +139,7 @@ def ground_topic(topic: str) -> GroundingResult:
         articles = []
     for title, url, extract in articles[:3]:
         parts.append(f"--- Wikipedia: {title} ({url}) ---\n{extract}")
-        sources.append(f"Wikipedia — {title}")
+        sources.append(f"Wikipedia — {title}: {url}")
     try:
         ddg = _duckduckgo(topic)
     except Exception:

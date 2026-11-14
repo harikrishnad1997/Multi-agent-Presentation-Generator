@@ -16,6 +16,7 @@ Escaping order matters: backslash first, then the special chars.
 from __future__ import annotations
 
 import re
+from text_unidecode import unidecode
 
 from .models import Deck
 
@@ -34,8 +35,8 @@ _LATEX_SPECIALS = [
 
 
 def escape_latex(text: str) -> str:
-    """Escape plain text so it is safe inside a LaTeX document."""
-    out = str(text)
+    """Escape plain text and transliterate glyphs unsupported by pdfLaTeX."""
+    out = unidecode(str(text))
     for old, new in _LATEX_SPECIALS:
         out = out.replace(old, new)
     return out
@@ -47,6 +48,7 @@ def render_beamer(deck: Deck, author: str, institute: str, theme: str = "Madrid"
         r"\documentclass{beamer}",
         rf"\usetheme{{{theme}}}",
         r"\usepackage{graphicx}",
+        r"\usepackage{url}",
         rf"\title{{{escape_latex(deck.title)}}}",
         rf"\author{{{escape_latex(author)}}}",
         rf"\institute{{{escape_latex(institute)}}}",
@@ -59,11 +61,36 @@ def render_beamer(deck: Deck, author: str, institute: str, theme: str = "Madrid"
         "",
     ]
     for slide in sorted(deck.slides, key=lambda s: s.number):
-        lines.append(rf"\begin{{frame}}{{{escape_latex(slide.title)}}}")
+        is_references = slide.title.strip().lower().startswith("references")
+        frame_options = "[fragile]" if is_references else ""
+        lines.append(rf"\begin{{frame}}{frame_options}{{{escape_latex(slide.title)}}}")
+        if slide.image_file and not slide.chart_file:
+            lines.append(r"  \begin{columns}[T]")
+            lines.append(r"    \begin{column}{0.58\textwidth}")
         lines.append(r"  \begin{itemize}")
+        if is_references:
+            lines.append(r"    \footnotesize")
         for bullet in slide.bullets:
-            lines.append(rf"    \item {escape_latex(bullet)}")
+            if is_references:
+                match = re.search(r"https?://\S+", bullet)
+                if match:
+                    label = bullet[:match.start()].rstrip(" —:-")
+                    url = match.group(0).rstrip(".,;)")
+                    lines.append(rf"    \item {escape_latex(label)}\par \url{{{url}}}")
+                else:
+                    lines.append(rf"    \item {escape_latex(bullet)}")
+            else:
+                lines.append(rf"    \item {escape_latex(bullet)}")
         lines.append(r"  \end{itemize}")
+        if slide.image_file and not slide.chart_file:
+            lines.append(r"    \end{column}")
+            lines.append(r"    \begin{column}{0.38\textwidth}")
+            lines.append(r"      \centering")
+            lines.append(rf"      \includegraphics[width=\linewidth,height=0.48\textheight,keepaspectratio]{{{slide.image_file}}}")
+            if slide.image_source:
+                lines.append(rf"      \par \tiny{{Source: {escape_latex(slide.image_source)}}}")
+            lines.append(r"    \end{column}")
+            lines.append(r"  \end{columns}")
         if slide.chart_file:
             lines.append(r"  \begin{center}")
             lines.append(rf"    \includegraphics[width=0.72\textwidth]{{{slide.chart_file}}}")
