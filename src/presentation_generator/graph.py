@@ -12,6 +12,13 @@ after that does the deterministic Beamer renderer turn the deck
 into LaTeX (never LLM-generated LaTeX), the Reviewer checks it, and
 the Compiler writes the files and builds the PDF if an engine exists.
 
+If the Reviewer finds critical issues, the process starts again from
+the Planner — a fresh outline, fresh slides — with the reviewer's
+findings fed in as feedback, instead of patching the failed deck in
+place. Up to 3 full attempts; if the last one still fails, its deck
+is compiled as-is with the failing review recorded honestly.
+
+
 GPT is the LLM throughout (default gpt-4o-mini, overridable with
 --model / OPENAI_MODEL). See llm.py for how the key is reached.
 """
@@ -34,7 +41,7 @@ from .latex_utils import render_beamer, validate_latex
 from .llm import get_llm
 from .models import ChartSpec, Deck, Outline, ReviewIssue, ReviewResult, SlideBrief, SlideContent
 
-MAX_REVIEW_ROUNDS = 3
+MAX_ATTEMPTS = 3  # full builds: first try + up to 2 restarts
 
 
 class PresentationState(TypedDict, total=False):
@@ -49,6 +56,7 @@ class PresentationState(TypedDict, total=False):
     latex: str
     review: dict
     attempts: int
+    build_attempt: int
     review_issues: str
     output_dir: str
     pdf_path: str | None
@@ -216,9 +224,11 @@ def _repair_outline(outline: Outline, n: int, visual_target: int, llm=None, topi
 
 # ---------------------------------------------------------------- planner
 def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
-                 charts_enabled: bool, source_text: str = "") -> Outline:
+                 charts_enabled: bool, source_text: str = "", review_feedback: str = "") -> Outline:
     """Plan + validate + repair. Pure function, shared by the LangGraph
-    node and by the A2A Planner agent — one implementation, two transports."""
+    node and by the A2A Planner agent — one implementation, two transports.
+    review_feedback is the previous build's reviewer findings, passed in
+    on a restart so the new outline cannot repeat the same failure."""
     llm = get_llm(model)
     n = num_slides
     visual_target = max(0, (n - 1) // 3) if charts_enabled else 0
@@ -246,6 +256,12 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
     user = f"Topic: {topic}\nAuthor: {author}\nAudience: general, curious non-experts unless the topic says otherwise."
     if source_text:
         user += f"\n\nSource material (ground every slide in this):\n{source_text}"
+    if review_feedback:
+        user += (
+            "\n\nA previous build of this deck FAILED review for these reasons:\n"
+            f"{review_feedback}\nFix every issue in this new outline — change titles, briefs "
+            "and visuals so the failure cannot repeat."
+        )
     outline: Outline | None = None
     problems: list[str] = []
     for _attempt in range(3):
@@ -266,12 +282,21 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
 
 
 def planner(state: PresentationState) -> dict:
+    # On a restart this is a fresh build: the reviewer's findings become
+    # planner feedback, and every artifact of the failed build is cleared
+    # so nothing stale (old deck, old LaTeX, old issues) leaks into it.
+    feedback = state.get("review_issues", "")
     outline = plan_outline(
         state["topic"], state.get("author", ""), state.get("num_slides", 6),
         state.get("model"), bool(state.get("charts_enabled", True)),
         source_text=state.get("source_text", ""),
+        review_feedback=feedback,
     )
-    return {"outline": outline.model_dump(), "attempts": 0, "slides": []}
+    return {
+        "outline": outline.model_dump(), "attempts": 0, "slides": [],
+        "deck": {}, "latex": "", "chart_count": 0, "review_issues": "",
+        "build_attempt": state.get("build_attempt", 0) + 1,
+    }
 
 
 def route_planner(state: PresentationState):
@@ -352,7 +377,13 @@ def write_slide(state: PresentationState) -> dict:
     outline = Outline.model_validate(state["outline"])
     slide = write_one_slide(brief, outline, state.get("prev_title") or "", state.get("next_title") or "",
                           state.get("model"), source_text=state.get("source_text", ""))
-    return {"slides": [slide.model_dump()]}
+    # Tag the slide with its build: the slides channel is an
+    # operator.add accumulator, so a restart would otherwise leave the
+    # failed build's slides in state and the editor would see both
+    # builds at once. The tag is dropped by SlideContent validation.
+    slide_dict = slide.model_dump()
+    slide_dict["build_attempt"] = state.get("build_attempt", 1)
+    return {"slides": [slide_dict]}
 
 
 # -------------------------------------------------------------- flow editor
@@ -456,6 +487,16 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         _seen.add(_key)
         _final.append(s)
     edited = _final
+    # Hard cap: the deck must have exactly `target` slides. The chunk
+    # editor can ADD slides (it returned 9 for a 6-slide deck on a
+    # restart) and nothing downstream checks the count, so the extra
+    # slides used to reach the PDF silently. Trim deterministically:
+    # first (target-1) content slides plus the ending slide last.
+    if len(edited) > target:
+        endings = [s for s in edited if _is_ending(s.title)]
+        ending = endings[-1] if endings else None
+        body = [s for s in edited if not _is_ending(s.title)]
+        edited = (body[: target - 1] + [ending]) if ending is not None else body[:target]
     # Normalise numbering in final order.
     for i, slide in enumerate(sorted(edited, key=lambda s: s.number), start=1):
         slide.number = i
@@ -463,15 +504,18 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
 
 
 def editor(state: PresentationState) -> dict:
-    """LangGraph node. On a revise round, start from the edited deck —
-    never from the raw writer slides, or the previous round's fixes
-    (including a dropped duplicate) get reintroduced. That was the
-    30-slide revise bug."""
+    """LangGraph node. If a deck is already in state (only on a
+    restart, and the planner has cleared it by then) start from it;
+    otherwise start from the raw writer slides."""
     outline = Outline.model_validate(state["outline"])
     if state.get("deck"):
         slides = [SlideContent.model_validate(s) for s in Deck.model_validate(state["deck"]).slides]
     else:
-        slides = [SlideContent.model_validate(s) for s in state.get("slides", [])]
+        # Only this build's slides: the accumulator still holds the
+        # failed attempts' slides (see write_slide's build_attempt tag).
+        current = state.get("build_attempt", 1)
+        raw = [s for s in state.get("slides", []) if s.get("build_attempt", current) == current]
+        slides = [SlideContent.model_validate(s) for s in raw]
     comments_raw = state.get("comments", "")
     if comments_raw:
         from .comments import apply_comments, parse_comments
@@ -586,10 +630,17 @@ def reviewer(state: PresentationState) -> dict:
 
 
 def route_reviewer(state: PresentationState) -> str:
+    """Reviewer verdict: a passing deck compiles. A failing deck
+    starts the process again from the planner — with the reviewer's
+    findings as feedback — up to MAX_ATTEMPTS full builds. After the
+    last attempt the deck compiles as-is and the failing review is
+    recorded honestly in review.json."""
     review = ReviewResult.model_validate(state["review"])
-    if review.passed or state.get("attempts", 0) >= MAX_REVIEW_ROUNDS:
+    if review.passed:
         return "compile"
-    return "revise"
+    if state.get("build_attempt", 1) < MAX_ATTEMPTS:
+        return "restart"
+    return "compile"
 
 
 # ----------------------------------------------------------------- compiler
@@ -636,7 +687,6 @@ def build_graph():
     builder.add_node("render_charts", render_charts)
     builder.add_node("render_latex", render_latex)
     builder.add_node("reviewer", reviewer)
-    builder.add_node("revise", editor)
     builder.add_node("compile", compile_output)
 
     builder.add_edge(START, "planner")
@@ -645,29 +695,30 @@ def build_graph():
     builder.add_edge("editor", "render_charts")
     builder.add_edge("render_charts", "render_latex")
     builder.add_edge("render_latex", "reviewer")
-    builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "revise": "revise"})
-    builder.add_edge("revise", "render_charts")
+    builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
     return builder.compile()
 
 
 def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         model: str | None = None, output_dir: str = "out", charts_enabled: bool = True,
-        source_text: str = "", comments: str = "", search: bool = True) -> dict:
+        source_text: str = "", comments: str = "", search: bool = True,
+        shallow: bool = False) -> dict:
     from .tracing import flush, get_callbacks
 
     graph = build_graph()
     grounding = {"mode": "source", "sources": []}
     if not source_text and search:
-        # No --source: ground the topic in web search (Wikipedia +
-        # DuckDuckGo) so the slides are not made up. The search text
-        # becomes the source the planner/writers must stick to.
-        from .search_grounding import ground_topic
+        # No --source: research first, then the deck. research_topic
+        # plans sub-queries, searches the web, fetches pages, and
+        # synthesizes a research brief; the brief becomes the source
+        # the planner/writers must stick to.
+        from .research import research_topic
 
-        found = ground_topic(topic)
-        if found.found:
-            source_text = found.text
-            grounding = {"mode": "search", "sources": found.sources}
+        found = research_topic(topic, model, shallow=shallow)
+        if found.brief:
+            source_text = found.brief
+            grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}
         else:
             grounding = {"mode": "none", "sources": []}
     elif not source_text:
@@ -681,6 +732,7 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         "output_dir": output_dir,
         "slides": [],
         "attempts": 0,
+        "build_attempt": 0,
         "charts_enabled": charts_enabled,
         "chart_count": 0,
         "source_text": source_text,

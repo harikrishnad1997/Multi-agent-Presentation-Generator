@@ -50,7 +50,8 @@ def main() -> int:
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default="out-a2a")
     ap.add_argument("--no-charts", action="store_true")
-    ap.add_argument("--no-search", action="store_true", help="Skip web-search grounding (default: every topic build is grounded in Wikipedia search)")
+    ap.add_argument("--no-search", action="store_true", help="Skip grounding entirely (deck is from model knowledge only)")
+    ap.add_argument("--shallow", action="store_true", help="Skip deep research; use the quick Wikipedia-only grounding instead")
     args = ap.parse_args()
 
     root = Path(__file__).parent
@@ -96,7 +97,7 @@ def main() -> int:
             topic=topic, author=args.author, institute=args.institute,
             num_slides=args.slides, model=args.model, output_dir=args.out,
             charts_enabled=not args.no_charts, source_text=source_text, comments=comments,
-            search=not args.no_search,
+            search=not args.no_search, shallow=args.shallow,
         )
         elapsed = time.time() - started
         deck = result.get("deck", {})
@@ -106,7 +107,11 @@ def main() -> int:
             chart = " + chart" if slide.get("chart_file") else ""
             print(f"  {slide['number']}. {slide['title']} ({len(slide.get('bullets', []))} bullets{chart})")
         grounding = result.get("grounding", {})
-        if grounding.get("mode") == "search":
+        if grounding.get("mode") == "research":
+            print(f"Deep research: {len(grounding.get('sources', []))} sources across {len(grounding.get('queries', []))} questions")
+            for src in grounding.get("sources", []):
+                print(f"  - {src}")
+        elif grounding.get("mode") == "search":
             print(f"Grounded in web search: {'; '.join(grounding.get('sources', []))}")
         elif grounding.get("mode") == "source":
             print("Grounded in the source you gave (--source).")

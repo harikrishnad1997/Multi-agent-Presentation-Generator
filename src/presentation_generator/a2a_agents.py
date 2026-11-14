@@ -112,6 +112,7 @@ class PlannerAgent(_JsonAgent):
             payload["topic"], payload.get("author", ""), int(payload.get("num_slides", 6)),
             payload.get("model"), bool(payload.get("charts_enabled", True)),
             source_text=payload.get("source_text", ""),
+            review_feedback=payload.get("review_feedback", ""),
         )
         return {"outline": outline.model_dump()}
 

@@ -21,12 +21,20 @@ on LaTeX — see `latex_utils.py`.
 
 ```
 topic
+  -> Deep Research: plans sub-questions, searches the web (Bing),
+     fetches the top pages, synthesizes a research brief — the deck
+     is grounded in that brief, not in model knowledge alone
   -> Planner: structured outline, one brief per slide
   -> Slide Writers (parallel, one agent per slide, via LangGraph Send)
   -> Flow Editor: reads the whole deck in order — narrative arc,
      transitions, duplicated points, ordering, tone
   -> LaTeX: deterministic Beamer rendering from the structured deck
-  -> Reviewer: LLM review + structural LaTeX checks, max 3 rounds
+  -> Reviewer: LLM review + structural LaTeX checks
+     - if it finds critical issues, the process starts again from
+       the Planner (fresh outline, fresh slides), with the
+       reviewer's findings fed in as feedback — up to 3 full
+       attempts. If the last attempt still fails, its deck compiles
+       as-is and the failing review is recorded in review.json.
   -> Compiler: writes .tex / .json, builds PDF if tectonic/pdflatex exists
 ```
 
@@ -61,10 +69,11 @@ The first 30-slide run failed review on a duplicated Conclusion
 planner outlines are now validated (exact slide count, exact
 visual count, exactly one ending slide, last) with retry +
 deterministic repair; the editor may drop a duplicated slide and
-fills any shortfall with fresh content slides; revise rounds start
-from the edited deck, never from raw writer slides; the compiler
-now uses absolute output paths (the relative `-output-directory`
-+ cwd combination made pdflatex fail to write).
+fills any shortfall with fresh content slides, and the deck is
+capped back to exactly the requested slide count if the editor
+adds slides; the compiler now uses absolute output paths (the
+relative `-output-directory` + cwd combination made pdflatex fail
+to write).
 
 Why parallel writers + a separate editor: writers run in parallel
 (writing N slides takes roughly the time of the slowest single
@@ -137,19 +146,28 @@ goes to the Planner and to each Writer with one hard rule: base every
 bullet on a fact in the source, never invent one. For a private repo,
 clone it locally and pass the folder. Same flags work on `run_a2a.py`.
 
-## Search grounding (slides are not made up)
+## Deep research first (slides are not made up)
 
-Every topic build is grounded in web search by default — no flag
-needed. Before the Planner runs, the topic is searched on Wikipedia
-(top articles, disambiguation pages skipped, each candidate scored
-on the topic's own words) plus a DuckDuckGo abstract, and that text
-becomes the source the Planner and Writers must stick to, under the
-same "never invent a fact" rule as `--source`. The run prints what
-it was grounded in, e.g. `Grounded in web search: Wikipedia —
-Agent2Agent`. If search finds nothing reliable, the deck still
-builds from model knowledge but says so plainly instead of
-pretending to be grounded. `--no-search` turns it off; `--source`
-already grounds the deck, so search is skipped then.
+Every topic build does deep research before the Planner runs — no
+flag needed. The LLM turns the topic into 5 research questions
+(origins, key facts & dates, how it works, adoption & use cases,
+challenges & latest developments); each question is searched on
+Bing (no API key — DuckDuckGo's HTML endpoint is unreachable from
+here) and the top fresh pages are fetched and read as text; the
+Wikipedia grounding is added as the encyclopedic base. The LLM
+then synthesizes a structured research brief from those excerpts
+only — overview, key facts with dates and numbers, timeline, how
+it works, use cases, challenges — and that brief becomes the source
+the Planner and Writers must stick to, under the same "never
+invent a fact" rule as `--source`. The run prints what it was
+grounded in, e.g. `Deep research: 6 sources across 5 questions`
+with the source list. If search finds nothing reliable, the deck
+falls back to the Wikipedia-only grounding; if even that finds
+nothing, it builds from model knowledge but says so plainly
+instead of pretending to be grounded. `--shallow` skips the deep
+phase and uses the quick Wikipedia-only grounding; `--no-search`
+turns grounding off entirely; `--source` already grounds the deck,
+so research is skipped then.
 
 ## Tracing (Opik)
 
@@ -197,4 +215,5 @@ tool-calling, so it works identically on both backends.
 - `src/presentation_generator/comments.py` — user comments that edit a deck
 - `src/presentation_generator/sources.py` — build a deck from a PDF / file / repo
 - `src/presentation_generator/search_grounding.py` — Wikipedia + DuckDuckGo grounding
+- `src/presentation_generator/research.py` — deep research: plan questions, Bing search, fetch pages, synthesize brief
 - `src/presentation_generator/tracing.py` — Opik tracing (no-op without a key)

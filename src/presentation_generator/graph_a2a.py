@@ -20,7 +20,7 @@ from langgraph.types import Send
 from .a2a_agents import PORTS
 from .a2a_client import call_agent_sync
 from .graph import (
-    MAX_REVIEW_ROUNDS,
+    MAX_ATTEMPTS,
     PresentationState,
     compile_output,
     render_latex,
@@ -44,8 +44,13 @@ def make_a2a_graph(urls: dict | None = None):
             "num_slides": state.get("num_slides", 6), "model": state.get("model"),
             "charts_enabled": bool(state.get("charts_enabled", True)),
             "source_text": state.get("source_text", ""),
+            "review_feedback": state.get("review_issues", ""),
         })
-        return {"outline": result["outline"], "attempts": 0, "slides": []}
+        return {
+            "outline": result["outline"], "attempts": 0, "slides": [],
+            "deck": {}, "latex": "", "chart_count": 0, "review_issues": "",
+            "build_attempt": state.get("build_attempt", 0) + 1,
+        }
 
     def route_planner(state: PresentationState):
         outline = Outline.model_validate(state["outline"])
@@ -65,11 +70,17 @@ def make_a2a_graph(urls: dict | None = None):
             "prev_title": state.get("prev_title", ""), "next_title": state.get("next_title", ""),
             "model": state.get("model"), "source_text": state.get("source_text", ""),
         })
-        return {"slides": [result["slide"]]}
+        slide = result["slide"]
+        slide["build_attempt"] = state.get("build_attempt", 1)
+        return {"slides": [slide]}
 
     def editor(state: PresentationState) -> dict:
-        # Revise rounds start from the edited deck, never raw writer slides.
+        # Only this build's slides: the accumulator still holds the
+        # failed attempts' slides (see write_slide's build_attempt tag).
         slides = state["deck"]["slides"] if state.get("deck") else state.get("slides", [])
+        if not state.get("deck"):
+            current = state.get("build_attempt", 1)
+            slides = [s for s in slides if s.get("build_attempt", current) == current]
         result = call_agent_sync(base["editor"], {
             "outline": state["outline"], "slides": slides,
             "review_issues": state.get("review_issues", ""),
@@ -107,7 +118,6 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_node("render_charts", render_charts)
     builder.add_node("render_latex", render_latex)
     builder.add_node("reviewer", reviewer)
-    builder.add_node("revise", editor)
     builder.add_node("compile", compile_output)
 
     builder.add_edge(START, "planner")
@@ -116,8 +126,7 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_edge("editor", "render_charts")
     builder.add_edge("render_charts", "render_latex")
     builder.add_edge("render_latex", "reviewer")
-    builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "revise": "revise"})
-    builder.add_edge("revise", "render_charts")
+    builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
     return builder.compile()
 
@@ -125,17 +134,18 @@ def make_a2a_graph(urls: dict | None = None):
 def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
             model: str | None = None, output_dir: str = "out",
             charts_enabled: bool = True, urls: dict | None = None,
-            source_text: str = "", comments: str = "", search: bool = True) -> dict:
+            source_text: str = "", comments: str = "", search: bool = True,
+            shallow: bool = False) -> dict:
     from .tracing import flush, get_callbacks
 
     grounding = {"mode": "source", "sources": []}
     if not source_text and search:
-        from .search_grounding import ground_topic
+        from .research import research_topic
 
-        found = ground_topic(topic)
-        if found.found:
-            source_text = found.text
-            grounding = {"mode": "search", "sources": found.sources}
+        found = research_topic(topic, model, shallow=shallow)
+        if found.brief:
+            source_text = found.brief
+            grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}
         else:
             grounding = {"mode": "none", "sources": []}
     elif not source_text:
@@ -145,7 +155,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
     initial: PresentationState = {
         "topic": topic, "author": author, "institute": institute,
         "num_slides": num_slides, "model": model or "", "output_dir": output_dir,
-        "slides": [], "attempts": 0, "charts_enabled": charts_enabled, "chart_count": 0,
+        "slides": [], "attempts": 0, "build_attempt": 0, "charts_enabled": charts_enabled, "chart_count": 0,
         "source_text": source_text, "comments": comments,
     }
     try:
