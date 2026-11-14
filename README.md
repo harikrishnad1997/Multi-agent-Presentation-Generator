@@ -1,220 +1,159 @@
 # Multi-agent Presentation Generator
 
-Generate a Beamer (LaTeX) presentation from a topic, with LangChain
-agents orchestrated by LangGraph — and GPT as the LLM throughout.
+Generate research-grounded Beamer presentations from a topic or source document. A team of specialized agents plans the deck, writes slides in parallel, edits the narrative, creates charts, and reviews the result. The project supports both an in-process LangGraph workflow and a distributed version that communicates over Google's Agent2Agent (A2A) protocol.
 
-This replaces the original June 2024 stub, which was a single
-hardcoded Gemini deck in `example.py` with no LLM call at all. That
-file also had a real bug: it did `text.replace('\\n', '\n')` on LLM
-output, which rewrote the `\n` inside `\note{...}` into a newline +
-`ote{...}`. This version never does string-level newline replacement
-on LaTeX — see `latex_utils.py`.
+## Features
 
-## Example output
+- Build presentations from a topic, PDF, text or Markdown file, local folder, or public GitHub repository.
+- Research topics before drafting, with source grounding and a Wikipedia-only quick mode.
+- Plan and write slides with LangChain and LangGraph, including parallel slide writing.
+- Edit an existing deck using plain-language comments without regenerating every slide.
+- Create deterministic charts and render structured slide content to LaTeX Beamer.
+- Review generated decks and retry when critical issues are found.
+- Optionally build a PDF when `tectonic` or `pdflatex` is installed.
+- Trace agent and model activity with Opik when configured.
 
-- [A2A Agent Protocol, 30 slides, 9 charts (PDF)](examples/a2a-agent-protocol-30-slides.pdf) —
-  built by the A2A run (`run_a2a.py --topic "A2A Agent Protocol (Google Agent2Agent)" --slides 30`,
-  search-grounded on Wikipedia): 30 slides, 9 charts (the full 9/9 visuals),
-  review passed. Slides 14 (Case Studies) and 18 (User Adoption) were
-  filled out from deep-research facts via `main.py --edit`.
+## Requirements
 
-## Flow
+- Python 3.10 or newer
+- An OpenAI API key (`OPENAI_API_KEY`) for standard use
+- `tectonic` or `pdflatex` to compile the generated Beamer source to PDF (optional)
 
-```
-topic
-  -> Deep Research: plans sub-questions, searches the web (Bing),
-     fetches the top pages, synthesizes a research brief — the deck
-     is grounded in that brief, not in model knowledge alone
-  -> Planner: structured outline, one brief per slide
-  -> Slide Writers (parallel, one agent per slide, via LangGraph Send)
-  -> Flow Editor: reads the whole deck in order — narrative arc,
-     transitions, duplicated points, ordering, tone
-  -> LaTeX: deterministic Beamer rendering from the structured deck
-  -> Reviewer: LLM review + structural LaTeX checks
-     - if it finds critical issues, the process starts again from
-       the Planner (fresh outline, fresh slides), with the
-       reviewer's findings fed in as feedback — up to 3 full
-       attempts. If the last attempt still fails, its deck compiles
-       as-is and the failing review is recorded in review.json.
-  -> Compiler: writes .tex / .json, builds PDF if tectonic/pdflatex exists
+Install the Python dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-## A2A version
+## Quick start
 
-The same pipeline over Google's Agent2Agent protocol
-(`run_a2a.py`, `src/presentation_generator/a2a_agents.py`,
-`src/presentation_generator/a2a_client.py`,
-`src/presentation_generator/a2a_server.py`,
-`src/presentation_generator/graph_a2a.py`):
+Create a presentation from a topic:
 
-- Each agent — Planner, Writer, Editor, Chart, Reviewer — is a
-  real A2A agent (`a2a-sdk==0.3.26`, the classic Starlette
-  implementation; 1.x moved AgentCard to protobuf types and dropped
-  the app factory, the wire protocol is the same). It publishes an
-  Agent Card at `/.well-known/agent-card.json` and serves
-  JSON-RPC `message/send` on its own port: planner 8101, writer
-  8102, editor 8103, chart 8104, reviewer 8105.
-- LangGraph stays as the orchestrator, but its nodes are A2A
-  clients: they resolve the Card, send a Message with the JSON
-  payload, and read the Task artifact back. Agents share the core
-  functions in `graph.py`, so there is one implementation and two
-  transports (in-process, and A2A over HTTP).
-- `python run_a2a.py --topic "Google Gemini" --slides 30 --out out/gemini30-a2a`
-  starts all five servers, waits for their Cards, runs the
-  pipeline, and shuts them down.
+```bash
+python main.py \
+  --topic "Google Gemini" \
+  --author "Your Name" \
+  --institute "Your Organization" \
+  --slides 6 \
+  --out out/gemini
+```
 
-## 30-slide fixes (v0.2)
+The title slide is added in addition to the requested number of content slides. The output folder contains `presentation.tex`, `deck.json`, `outline.json`, and `review.json`; it also contains `presentation.pdf` when a LaTeX compiler is available.
 
-The first 30-slide run failed review on a duplicated Conclusion
-(slides 24+25) and produced only 4 charts instead of 9. Fixed:
-planner outlines are now validated (exact slide count, exact
-visual count, exactly one ending slide, last) with retry +
-deterministic repair; the editor may drop a duplicated slide and
-fills any shortfall with fresh content slides, and the deck is
-capped back to exactly the requested slide count if the editor
-adds slides; the compiler now uses absolute output paths (the
-relative `-output-directory` + cwd combination made pdflatex fail
-to write).
-
-Why parallel writers + a separate editor: writers run in parallel
-(writing N slides takes roughly the time of the slowest single
-slide, not N times as long) and each one stays strictly on its
-brief, but no single writer can see the whole story. The editor is
-the agent that can — it reorders, cuts duplicates, and smooths
-transitions. Results are collected by slide number, not finish
-order, so the deck never scrambles; if one slide's LLM call fails,
-that slide falls back to its brief (key points as bullets) instead
-of killing the whole deck.
-
-Why LaTeX is rendered, not generated: an LLM writing raw LaTeX is
-where decks break (unescaped `%`, missing `\end{frame}`). The deck
-is structured JSON until the last step, then a fixed template renders
-it with proper escaping.
+An example presentation is available at [`examples/a2a-agent-protocol-30-slides.pdf`](examples/a2a-agent-protocol-30-slides.pdf).
 
 ## Usage
 
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+### Build from a source
 
-python main.py --topic "Google Gemini" --author "Harikrishna Dev" \
-  --institute "University of Texas at Dallas" --slides 6 --out out/gemini
+Supported sources include PDFs, `.txt` and `.md` files, local directories, and public GitHub repositories. When `--topic` is omitted, the source title is used.
+
+```bash
+python main.py --source ~/Documents/paper.pdf --slides 10 --out out/paper
+python main.py --source https://github.com/owner/repository --slides 10 --out out/repository
 ```
 
-Output in the `--out` folder: `presentation.tex`, `deck.json`,
-`outline.json`, `review.json`, and `presentation.pdf` if a LaTeX
-engine (`tectonic` or `pdflatex`) is installed.
+Source-based decks are grounded in the supplied material. The source content is provided to the planning and writing agents with instructions to avoid introducing unsupported facts.
 
-## Editing a deck with your comments
+### Edit an existing deck
+
+Pass comments directly or through a comments file. Comments can target a slide, change its content, or request a slide be added or removed.
 
 ```bash
-# Edit an existing deck — no slide is regenerated from scratch.
-# The Flow Editor applies each comment, then the deck is re-rendered
-# and re-compiled.
-python main.py --edit out/gemini/deck.json --outline out/gemini/outline.json \
-  --comments $'Slide 5: shorten the bullets to one line each\nDrop slide 12, it repeats slide 9' \
-  --out out/gemini-v2
+python main.py \
+  --edit out/gemini/deck.json \
+  --outline out/gemini/outline.json \
+  --comments $'Slide 5: shorten the bullets\nDrop slide 6, it repeats slide 3' \
+  --out out/gemini-revised
+```
 
-# Or apply comments on a fresh build (same flags work on run_a2a.py too).
+Comments can also be applied while building a new deck:
+
+```bash
 python main.py --topic "Google Gemini" --slides 6 \
   --comments "overall: keep every bullet under 12 words" --out out/gemini
 ```
 
-Comments are one per line, optionally aimed at a slide
-(`Slide 5: ...`, `overall: ...`); a JSON file works too
-(`--comments-file comments.json`, `{"comments": [{"slide": 5, "comment": "..."}]}`).
-A comment can rewrite, shorten, or drop a slide, or ask to
-`add a slide about X` — the new slide is written before the ending slide.
-Slide numbers are resolved to titles against the deck as you saw
-it, so adding or dropping a slide never shifts a later comment's
-target; a near-duplicate title (e.g. "Gemini Pricing Tiers" when
-"Pricing Tiers" already exists) is folded into the existing slide
-instead of added as a second one.
+### Run with A2A agents
 
-## Building a deck from a source
+The A2A entry point starts the Planner, Writer, Editor, Chart, and Reviewer servers, runs the workflow, and then shuts the servers down.
 
 ```bash
-# From a PDF — every slide is grounded in the document, not invented.
-python main.py --source ~/Downloads/paper.pdf --slides 10 --out out/paper
-
-# From a public GitHub repo (shallow-cloned: README + docs + file tree)
-# or a local folder/repo — topic defaults to the repo name.
-python main.py --source https://github.com/harikrishnad1997/Multi-agent-Presentation-Generator --slides 10 --out out/repo-deck
+python run_a2a.py --topic "Google Gemini" --slides 6 --out out/gemini-a2a
 ```
 
-Sources: `.pdf`, `.txt`/`.md`, a local folder, or a public GitHub
-repo URL. The source text (capped at ~12k chars, README/docs first)
-goes to the Planner and to each Writer with one hard rule: base every
-bullet on a fact in the source, never invent one. For a private repo,
-clone it locally and pass the folder. Same flags work on `run_a2a.py`.
+The agents publish Agent Cards and listen on ports 8101–8105 by default. See `src/presentation_generator/a2a_agents.py` for the port mapping.
 
-## Deep research first (slides are not made up)
+### Research and search options
 
-Every topic build does deep research before the Planner runs — no
-flag needed. The LLM turns the topic into 5 research questions
-(origins, key facts & dates, how it works, adoption & use cases,
-challenges & latest developments); each question is searched on
-Bing (no API key — DuckDuckGo's HTML endpoint is unreachable from
-here) and the top fresh pages are fetched and read as text; the
-Wikipedia grounding is added as the encyclopedic base. The LLM
-then synthesizes a structured research brief from those excerpts
-only — overview, key facts with dates and numbers, timeline, how
-it works, use cases, challenges — and that brief becomes the source
-the Planner and Writers must stick to, under the same "never
-invent a fact" rule as `--source`. The run prints what it was
-grounded in, e.g. `Deep research: 6 sources across 5 questions`
-with the source list. If search finds nothing reliable, the deck
-falls back to the Wikipedia-only grounding; if even that finds
-nothing, it builds from model knowledge but says so plainly
-instead of pretending to be grounded. `--shallow` skips the deep
-phase and uses the quick Wikipedia-only grounding; `--no-search`
-turns grounding off entirely; `--source` already grounds the deck,
-so research is skipped then.
+Deep research runs by default for topic-based decks. To use quick Wikipedia grounding or turn grounding off:
 
-## Tracing (Opik)
+```bash
+python main.py --topic "Quantum computing" --shallow --slides 8 --out out/quantum
+python main.py --topic "Internal brainstorming" --no-search --slides 8 --out out/brainstorm
+```
 
-One Opik trace per deck build — project `multi-agent-presentation-generator`,
-workspace `harikrishnad1997` (see `src/presentation_generator/tracing.py`,
-same pattern as Reel Chat). The LangChain `OpikTracer` callback traces
-every LLM call and LangGraph node in both the in-process and A2A runs,
-and each A2A agent also records its own span server-side.
+When a source is provided, its contents are used for grounding and the topic research phase is skipped. If reliable search material is unavailable, the run reports that limitation in its output.
 
-Tracing is on when `OPIK_API_KEY` is set (`PRESENTATION_OPIK=off` to
-disable it); without a key it is a strict no-op and a deck build is
-never affected. Tracing failures can never break a build — everything
-fails soft. The project is created automatically when the first trace
-lands. `opik` is pinned to `==2.2.138` (a newer unpinned Opik rejected
-the `llm` span type at import and crashed Reel Chat in Nov 2026).
+### Useful options
 
-## LLM — GPT
+| Option | Description |
+| --- | --- |
+| `--topic` | Presentation subject; optional when `--source` is provided |
+| `--source` | PDF, text/Markdown file, local folder, or public GitHub repository |
+| `--slides` | Number of content slides (default: 6; title slide is extra) |
+| `--author`, `--institute` | Title slide attribution |
+| `--model` | Override the default model (`gpt-4o-mini`) |
+| `--out` | Output directory (default: `out`) |
+| `--no-charts` | Disable chart generation |
+| `--shallow` | Skip deep research and use quick Wikipedia grounding |
+| `--no-search` | Disable topic grounding |
+| `--comments`, `--comments-file` | Apply editing instructions |
 
-Default model is `gpt-4o-mini` (`--model` / `OPENAI_MODEL` to change).
-The key is resolved in `src/presentation_generator/llm.py`:
+Run `python main.py --help` or `python run_a2a.py --help` for the full command-line help.
 
-- `OPENAI_API_KEY` set → LangChain `ChatOpenAI` (the normal path for
-  anyone cloning this repo).
-- Otherwise → a small LangChain `BaseChatModel` that shells out to
-  Muse's secure OpenAI connector helper, which injects the key at
-  request time. The key never appears in an env var, a file, the code,
-  or any output.
+## Configuration
 
-Structured output is JSON-only prompting + parsing, not
-tool-calling, so it works identically on both backends.
+The default model is `gpt-4o-mini`. Set `OPENAI_API_KEY` to use the OpenAI API, or set `OPENAI_MODEL` to choose a different default model. The application also supports the Muse secure OpenAI connector helper when available.
 
-## Layout
+Optional Opik tracing is enabled when `OPIK_API_KEY` is set. Set `PRESENTATION_OPIK=off` to disable tracing. Without an Opik key, tracing is a no-op and does not affect deck generation.
 
-- `main.py` — CLI
-- `run_a2a.py` — CLI for the A2A transport (starts the five agent servers)
-- `src/presentation_generator/graph.py` — LangGraph pipeline + agents
-- `src/presentation_generator/graph_a2a.py` — same pipeline over A2A
-- `src/presentation_generator/a2a_agents.py` — the five A2A agents
-- `src/presentation_generator/a2a_client.py` — A2A client (Card → message/send → artifact)
-- `src/presentation_generator/a2a_server.py` — A2A server entry point
-- `src/presentation_generator/llm.py` — GPT backends (ChatOpenAI / helper)
-- `src/presentation_generator/models.py` — Pydantic schemas agents speak
-- `src/presentation_generator/latex_utils.py` — Beamer rendering + validation
-- `src/presentation_generator/charts.py` — deterministic matplotlib charts
-- `src/presentation_generator/comments.py` — user comments that edit a deck
-- `src/presentation_generator/sources.py` — build a deck from a PDF / file / repo
-- `src/presentation_generator/search_grounding.py` — Wikipedia + DuckDuckGo grounding
-- `src/presentation_generator/research.py` — deep research: plan questions, Bing search, fetch pages, synthesize brief
-- `src/presentation_generator/tracing.py` — Opik tracing (no-op without a key)
+## How it works
+
+1. **Research** gathers topic information and prepares a research brief, unless grounding is disabled or a source is supplied.
+2. **Planner** creates a structured outline with a brief for each slide.
+3. **Writers** draft slides in parallel against their briefs.
+4. **Flow editor** reviews the deck as a whole, improving transitions and removing repetition.
+5. **Chart agent** prepares requested visuals.
+6. **Renderer and reviewer** convert structured slide data into Beamer LaTeX, validate the output, and review the deck. Critical issues can trigger a fresh planning and writing attempt.
+7. **Compiler** writes the output artifacts and builds a PDF when a supported LaTeX compiler is installed.
+
+Slide content remains structured data until rendering. This keeps LaTeX escaping and document structure under deterministic control rather than asking a language model to produce raw LaTeX.
+
+## Project structure
+
+```text
+main.py                             Main CLI
+run_a2a.py                          A2A CLI and server lifecycle
+src/presentation_generator/
+  graph.py                          In-process LangGraph workflow
+  graph_a2a.py                      LangGraph workflow using A2A clients
+  a2a_agents.py                     Agent implementations and port mapping
+  a2a_client.py                     A2A client helpers
+  a2a_server.py                     A2A server entry point
+  research.py                       Deep research workflow
+  search_grounding.py               Search and Wikipedia grounding
+  sources.py                        PDF, file, folder, and GitHub source loading
+  models.py                         Pydantic data models
+  latex_utils.py                    Beamer rendering and validation
+  charts.py                         Chart generation
+  comments.py                       Comment-based deck editing
+  llm.py                            Model configuration and backends
+  tracing.py                        Optional Opik tracing
+```
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
