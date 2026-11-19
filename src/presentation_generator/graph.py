@@ -33,6 +33,7 @@ import operator
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, TypedDict
 
@@ -43,6 +44,7 @@ from langgraph.types import Send
 from .charts import render_chart, validate_chart
 from .images import find_article_images, render_selected_images
 from .latex_utils import render_beamer, validate_latex
+from .latex_agent import create_slide_latex
 from .llm import get_llm
 from .models import ChartSpec, Deck, Outline, ReviewIssue, ReviewResult, SlideBrief, SlideContent
 
@@ -66,6 +68,7 @@ class PresentationState(TypedDict, total=False):
     output_dir: str
     pdf_path: str | None
     compile_log: str
+    compile_error: str
     charts_enabled: bool
     images_enabled: bool
     image_article_title: str
@@ -306,7 +309,7 @@ def planner(state: PresentationState) -> dict:
     )
     return {
         "outline": outline.model_dump(), "attempts": 0, "slides": [],
-        "deck": {}, "latex": "", "chart_count": 0, "review_issues": "",
+        "deck": {}, "latex": "", "chart_count": 0, "review_issues": "", "compile_error": "",
         "build_attempt": state.get("build_attempt", 0) + 1,
     }
 
@@ -642,16 +645,30 @@ def add_references(state: PresentationState) -> dict:
 # ------------------------------------------------------------------- latex
 def render_latex(state: PresentationState) -> dict:
     deck = Deck.model_validate(state["deck"])
-    latex = render_beamer(deck, state.get("author", ""), state.get("institute", ""))
-    return {"latex": latex}
+    # The post-edit slide content is authoritative. Ask the per-slide LaTeX
+    # agent for each final frame, retain the fragments on the deck, and assemble
+    # those exact fragments for compile and review.
+    ordered = sorted(deck.slides, key=lambda s: s.number)
+    # One independent LaTeX task per final slide; map preserves slide order
+    # while the workers run concurrently.
+    with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as pool:
+        parts = list(pool.map(create_slide_latex, ordered))
+    deck_dict = deck.model_dump()
+    for slide_dict, part in zip(sorted(deck_dict["slides"], key=lambda s: s["number"]), parts):
+        slide_dict["latex_part"] = part
+    latex = render_beamer(deck, state.get("author", ""), state.get("institute", ""), slide_parts=parts)
+    return {"deck": deck_dict, "latex": latex}
 
 
 # ----------------------------------------------------------------- reviewer
-def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None) -> ReviewResult:
+def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None,
+                compile_error: str = "") -> ReviewResult:
     """Review a deck + its LaTeX. Pure function, shared by the LangGraph
     node and by the A2A Reviewer agent."""
     llm = get_llm(model)
     problems = validate_latex(latex, len(deck.slides))
+    if compile_error:
+        problems.append(f"LaTeX compiler failed: {compile_error}")
     system = (
         "You review a presentation deck and its LaTeX. Output JSON only. "
         "Schema: {\"passed\": bool, \"issues\": [{\"severity\": str, \"slide\": int|null, \"issue\": str, \"fix\": str}], \"summary\": str}. "
@@ -674,6 +691,8 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None) -> 
             + (f"\nChart: {s.chart.title} ({s.chart.chart_type})" if s.chart else "")
             for s in deck.slides
         )
+        + "\n\nAssembled LaTeX source (the exact per-slide fragments compiled for this review):\n"
+        + "```latex\n" + latex + "\n```"
     )
     try:
         result = ReviewResult.model_validate(_chat_json(llm, system, user))
@@ -695,7 +714,7 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None) -> 
 def reviewer(state: PresentationState) -> dict:
     result = review_deck(
         Deck.model_validate(state["deck"]), state.get("latex", ""),
-        state.get("chart_count", 0), state.get("model"),
+        state.get("chart_count", 0), state.get("model"), state.get("compile_error", ""),
     )
     attempts = state.get("attempts", 0) + 1
     return {
@@ -720,6 +739,42 @@ def route_reviewer(state: PresentationState) -> str:
 
 
 # ----------------------------------------------------------------- compiler
+def _compile_tex(out_dir: Path) -> tuple[str | None, str, str]:
+    """Compile out_dir/presentation.tex. Returns (pdf_path, log, error).
+
+    Shared by the pre-review check and the final compile so both use the
+    same engine choice, pass count and failure handling. pdflatex runs
+    twice so the Madrid footline's frame totals and navigation resolve.
+    """
+    tex_file = out_dir / "presentation.tex"
+    pdf_file = out_dir / "presentation.pdf"
+    pdf_file.unlink(missing_ok=True)  # never mistake a previous build for this one
+    if shutil.which("tectonic"):
+        commands = [["tectonic", "-X", "compile", str(tex_file), "--outdir", str(out_dir)]]
+    elif shutil.which("pdflatex"):
+        commands = [["pdflatex", "-interaction=nonstopmode", "-output-directory", str(out_dir), str(tex_file)]] * 2
+    else:
+        return None, "No LaTeX engine found (tried tectonic, pdflatex). .tex written and validated; PDF not built.", ""
+    try:
+        for command in commands:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=300, cwd=str(out_dir))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc), str(exc)
+    log = (proc.stdout + proc.stderr)[-4000:]
+    pdf_path = str(pdf_file) if pdf_file.exists() else None
+    error = (log or f"Compiler exited with status {proc.returncode}.") if proc.returncode or not pdf_path else ""
+    return pdf_path, log, error
+
+
+def compile_check(state: PresentationState) -> dict:
+    """Compile the assembled document before review and retain its diagnostics."""
+    out_dir = Path(state.get("output_dir") or "out").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "presentation.tex").write_text(state.get("latex", ""), encoding="utf-8")
+    pdf_path, log, error = _compile_tex(out_dir)
+    return {"compile_error": error, "compile_log": log, "pdf_path": pdf_path}
+
+
 def compile_output(state: PresentationState) -> dict:
     # Absolute paths: the earlier relative -output-directory + cwd
     # combination made pdflatex look in out/<out>/ and fail to write.
@@ -730,29 +785,14 @@ def compile_output(state: PresentationState) -> dict:
     (out_dir / "outline.json").write_text(json.dumps(state.get("outline", {}), indent=2), encoding="utf-8")
     (out_dir / "review.json").write_text(json.dumps(state.get("review", {}), indent=2), encoding="utf-8")
 
-    pdf_path: str | None = None
-    log_lines: list[str] = []
-    tex_file = out_dir / "presentation.tex"
-    if shutil.which("tectonic"):
-        proc = subprocess.run(
-            ["tectonic", "-X", "compile", str(tex_file), "--outdir", str(out_dir)],
-            capture_output=True, text=True, timeout=300,
-        )
-        log_lines.append(proc.stdout[-2000:] + proc.stderr[-2000:])
-        if (out_dir / "presentation.pdf").exists():
-            pdf_path = str(out_dir / "presentation.pdf")
-    elif shutil.which("pdflatex"):
-        for _ in range(2):
-            proc = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-output-directory", str(out_dir), str(tex_file)],
-                capture_output=True, text=True, timeout=300, cwd=str(out_dir),
-            )
-        log_lines.append(proc.stdout[-2000:] + proc.stderr[-2000:])
-        if (out_dir / "presentation.pdf").exists():
-            pdf_path = str(out_dir / "presentation.pdf")
-    else:
-        log_lines.append("No LaTeX engine found (tried tectonic, pdflatex). .tex written and validated; PDF not built.")
-    return {"pdf_path": pdf_path, "compile_log": "\n".join(log_lines)}
+    # In the graph, compile_check already compiled this exact LaTeX (the
+    # reviewer routes straight here), so reuse its result instead of
+    # compiling again. Callers without a pre-check (comments revision)
+    # compile now.
+    if state.get("compile_log") is not None:
+        return {"pdf_path": state.get("pdf_path"), "compile_log": state["compile_log"]}
+    pdf_path, log, _ = _compile_tex(out_dir)
+    return {"pdf_path": pdf_path, "compile_log": log}
 
 
 def build_graph():
@@ -765,6 +805,7 @@ def build_graph():
     builder.add_node("render_images", render_images)
     builder.add_node("add_references", add_references)
     builder.add_node("render_latex", render_latex)
+    builder.add_node("compile_check", compile_check)
     builder.add_node("reviewer", reviewer)
     builder.add_node("compile", compile_output)
 
@@ -776,7 +817,8 @@ def build_graph():
     builder.add_edge("image_agent", "render_images")
     builder.add_edge("render_images", "add_references")
     builder.add_edge("add_references", "render_latex")
-    builder.add_edge("render_latex", "reviewer")
+    builder.add_edge("render_latex", "compile_check")
+    builder.add_edge("compile_check", "reviewer")
     builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
     return builder.compile()
@@ -787,9 +829,10 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         source_text: str = "", comments: str = "", search: bool = True,
         shallow: bool = False, images_enabled: bool = False,
         references: list[str] | None = None) -> dict:
-    from .tracing import flush, get_callbacks
+    from .tracing import flush, prepare_graph
 
     graph = build_graph()
+    graph, trace_config = prepare_graph(graph)
     grounding = {"mode": "source", "sources": []}
     source_references = list(references or [])
     if not source_text and search:
@@ -826,9 +869,9 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         "comments": comments,
     }
     try:
-        # OpikTracer callback traces every LLM call and LangGraph node
-        # when OPIK_API_KEY is set; empty list (no-op) otherwise.
-        result = graph.invoke(initial, config={"callbacks": get_callbacks()})
+        # Opik captures both the execution spans and compiled graph definition
+        # when OPIK_API_KEY is set; prepare_graph is a no-op otherwise.
+        result = graph.invoke(initial, config=trace_config)
         result["grounding"] = grounding
         return result
     finally:

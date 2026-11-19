@@ -39,9 +39,10 @@ from a2a.types import (
 from .graph import edit_deck, plan_outline, render_deck_charts, review_deck, write_one_slide
 from .tracing import span as opik_span
 from .latex_utils import render_beamer
+from .latex_agent import create_slide_latex
 from .models import Deck, Outline, SlideBrief, SlideContent
 
-PORTS = {"planner": 8101, "writer": 8102, "editor": 8103, "chart": 8104, "reviewer": 8105}
+PORTS = {"planner": 8101, "writer": 8102, "editor": 8103, "chart": 8104, "reviewer": 8105, "latex": 8106}
 
 
 def _payload(context: RequestContext) -> dict:
@@ -131,6 +132,14 @@ class WriterAgent(_JsonAgent):
         return {"slide": slide.model_dump()}
 
 
+class LatexAgent(_JsonAgent):
+    agent_name = "latex"
+    artifact_name = "latex_part"
+
+    def run(self, payload: dict) -> dict:
+        return {"latex_part": create_slide_latex(payload["slide"])}
+
+
 class EditorAgent(_JsonAgent):
     agent_name = "editor"
     artifact_name = "deck"
@@ -174,7 +183,8 @@ class ReviewerAgent(_JsonAgent):
     def run(self, payload: dict) -> dict:
         deck = Deck.model_validate(payload["deck"])
         latex = payload.get("latex") or render_beamer(deck, payload.get("author", ""), payload.get("institute", ""))
-        result = review_deck(deck, latex, int(payload.get("chart_count", 0)), payload.get("model"))
+        result = review_deck(deck, latex, int(payload.get("chart_count", 0)), payload.get("model"),
+                             payload.get("compile_error", ""))
         return {"review": result.model_dump()}
 
 
@@ -184,6 +194,7 @@ AGENT_CLASSES = {
     "editor": EditorAgent,
     "chart": ChartAgent,
     "reviewer": ReviewerAgent,
+    "latex": LatexAgent,
 }
 
 AGENT_DESCRIPTIONS = {
@@ -192,6 +203,7 @@ AGENT_DESCRIPTIONS = {
     "editor": "Flow editor: reads a deck in order, drops duplicated slides, fixes transitions and tone, fills any shortfall.",
     "chart": "Renders chart specs to PNG with matplotlib, deterministically.",
     "reviewer": "Reviews a deck and its LaTeX: duplicates, bullet counts, notes, chart validity, structural checks.",
+    "latex": "Renders one validated slide into a safe Beamer frame fragment for assembly into the presentation.",
 }
 
 

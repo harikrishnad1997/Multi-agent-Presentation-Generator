@@ -78,13 +78,13 @@ python main.py --topic "Google Gemini" --slides 6 \
 
 ### Run with A2A agents
 
-The A2A entry point starts the Planner, Writer, Editor, Chart, and Reviewer servers, runs the workflow, and then shuts the servers down.
+The A2A entry point starts the Planner, Writer, per-slide LaTeX, Editor, Chart, and Reviewer servers, runs the workflow, and then shuts the servers down. After editing, the orchestrator calls the LaTeX agent once per final slide to render its frame.
 
 ```bash
 python run_a2a.py --topic "Google Gemini" --slides 6 --out out/gemini-a2a
 ```
 
-The agents publish Agent Cards and listen on ports 8101–8105 by default. See `src/presentation_generator/a2a_agents.py` for the port mapping.
+The agents publish Agent Cards and listen on ports 8101–8106 by default. See `src/presentation_generator/a2a_agents.py` for the port mapping.
 
 ### Research and search options
 
@@ -199,6 +199,7 @@ Build and start the API, persisting generated files in the local `out` folder:
 docker build -t presentation-generator .
 docker run --rm -p 8000:8000 \
   -e OPENAI_API_KEY \
+  -e OPIK_API_KEY \
   -v "$(pwd)/out:/app/out" \
   presentation-generator
 ```
@@ -243,8 +244,8 @@ flowchart TD
 3. **Writers** draft slides in parallel against their briefs.
 4. **Flow editor** reviews the deck as a whole, improving transitions and removing repetition.
 5. **Chart agent** prepares requested visuals.
-6. **Renderer and reviewer** convert structured slide data into Beamer LaTeX, validate the output, and review the deck. Critical issues can trigger a fresh planning and writing attempt.
-7. **Compiler** writes the output artifacts and builds a PDF when a supported LaTeX compiler is installed.
+6. **LaTeX agents** render each final slide (after editing, visuals, and references) as a Beamer frame fragment, and the fragments are assembled into the complete document.
+7. **Compiler and reviewer** compile the assembled LaTeX before review when `tectonic` or `pdflatex` is available. Compiler errors become critical review issues and can trigger a fresh planning and writing attempt. The final compiler step writes the output artifacts and reuses the already-built PDF when available.
 
 Slide content remains structured data until rendering. This keeps LaTeX escaping and document structure under deterministic control rather than asking a language model to produce raw LaTeX.
 

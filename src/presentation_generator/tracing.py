@@ -115,6 +115,24 @@ def get_callbacks() -> list:
         return []
 
 
+def prepare_graph(graph):
+    """Attach Opik to a compiled LangGraph and return its invoke config.
+
+    ``track_langgraph`` records the compiled graph structure as well as run
+    spans. Keep the callback-only path as a compatibility fallback so tracing
+    remains best-effort if graph wrapping is unavailable.
+    """
+    callbacks = get_callbacks()
+    if not callbacks:
+        return graph, {}
+    try:
+        from opik.integrations.langchain import track_langgraph
+
+        return track_langgraph(graph, callbacks[0]), {}
+    except Exception:
+        return graph, {"callbacks": callbacks}
+
+
 def track(name, span_type="general"):
     """Decorator factory: opik.track when enabled, identity otherwise.
 

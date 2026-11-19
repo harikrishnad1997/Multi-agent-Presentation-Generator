@@ -30,7 +30,13 @@ def _plain(value: str) -> str:
 
 
 def find_article_images(topic: str) -> tuple[str, str, list[dict]]:
-    with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
+    # Wikimedia requires a descriptive User-Agent. Keep discovery and download
+    # requests consistent; an undefined `headers` here silently disabled the
+    # entire image stage because the graph catches discovery errors.
+    with httpx.Client(
+        timeout=20, follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
         search = client.get(API, params={
             "action": "query", "list": "search", "srsearch": topic,
             "srnamespace": 0, "srlimit": 5, "format": "json", "formatversion": 2,
@@ -69,7 +75,7 @@ def find_article_images(topic: str) -> tuple[str, str, list[dict]]:
 
         details = client.get(API, params={
             "action": "query", "prop": "imageinfo", "titles": "|".join(file_names),
-            "iiprop": "url|extmetadata", "iiurlwidth": 1200,
+            "iiprop": "url|mime|extmetadata", "iiurlwidth": 1200,
             "format": "json", "formatversion": 2,
         })
         details.raise_for_status()
@@ -111,7 +117,7 @@ def render_selected_images(deck, output_dir: str, article_title: str, article_ur
     with httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
         used_ids: set[int] = set()
         used_slides: set[int] = set()
-        for selection in selections[:2]:
+        for selection in selections[:5]:
             try:
                 image_id = int(selection["image_id"])
                 slide_number = int(selection["slide_number"])
