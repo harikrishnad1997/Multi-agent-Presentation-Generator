@@ -84,15 +84,15 @@ def make_a2a_graph(urls: dict | None = None):
         slides = state["deck"]["slides"] if state.get("deck") else state.get("slides", [])
         if not state.get("deck"):
             current = state.get("build_attempt", 1)
-            slides = [s for s in slides if s.get("build_attempt", current) == current]
+            slides = [s for s in slides if s.get("build_attempt") == current]  # strict: see graph.editor
         result = call_agent_sync(base["editor"], {
             "outline": state["outline"], "slides": slides,
             "review_issues": state.get("review_issues", ""),
             "topic": state.get("topic", ""), "num_slides": state.get("num_slides"),
             "model": state.get("model"), "comments": state.get("comments", ""),
+            "source_text": state.get("source_text", ""),
         })
-        deck = result["deck"]
-        return {"deck": deck, "slides": deck["slides"]}
+        return {"deck": result["deck"]}  # not into the slides accumulator: see graph.editor
 
     def render_charts(state: PresentationState) -> dict:
         result = call_agent_sync(base["chart"], {

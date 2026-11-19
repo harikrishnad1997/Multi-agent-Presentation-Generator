@@ -29,6 +29,11 @@ UA = {"User-Agent": "MAPG/0.3 (multi-agent-presentation-generator; contact: hari
 TIMEOUT = 15
 MAX_GROUNDING_CHARS = 6_000
 MAX_ARTICLE_CHARS = 2_500
+# A page is on-topic only if every distinctive topic word appears at least
+# this often. Measured on "Google Gemini": real articles score 9+ per word,
+# the zodiac "Gemini" article mentions "google" twice, google.com never
+# mentions "gemini".
+MIN_TERM_HITS = 3
 
 
 @dataclass
@@ -54,6 +59,12 @@ def _topic_words(topic: str) -> set[str]:
     drop = {"the", "a", "an", "of", "for", "and", "with", "to", "on", "in",
             "about", "overview", "introduction", "guide", "what", "is", "are"}
     return {w for w in re.findall(r"[a-z0-9]+", topic.lower()) if len(w) >= 3 and w not in drop}
+
+
+def is_relevant(words: set[str], *texts: str) -> bool:
+    """True when every topic word appears MIN_TERM_HITS+ times in the texts."""
+    haystack = " ".join(texts).lower()
+    return all(len(re.findall(rf"\b{re.escape(w)}\b", haystack)) >= MIN_TERM_HITS for w in words)
 
 
 def _article_text(title: str) -> str:
@@ -110,10 +121,10 @@ def _wikipedia(topic: str) -> list[tuple[str, str, str]]:
         text = _article_text(title)
         if not text:
             continue
-        low = text.lower()
-        score = sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", low))
-        if words and score == 0:
+        if not is_relevant(words, title, text):
             continue
+        low = text.lower()
+        score = sum(len(re.findall(rf"\b{re.escape(w)}\b", low)) for w in words)
         url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
         scored.append((-score, i, title, url, text))
     scored.sort()
