@@ -33,7 +33,6 @@ import operator
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, TypedDict
 
@@ -44,7 +43,6 @@ from langgraph.types import Send
 from .charts import render_chart, validate_chart
 from .images import find_article_images, render_selected_images
 from .latex_utils import render_beamer, validate_latex
-from .latex_agent import create_slide_latex
 from .llm import get_llm
 from .models import ChartSpec, Deck, Outline, ReviewIssue, ReviewResult, SlideBrief, SlideContent
 
@@ -644,20 +642,10 @@ def add_references(state: PresentationState) -> dict:
 
 # ------------------------------------------------------------------- latex
 def render_latex(state: PresentationState) -> dict:
+    # The post-edit slide content is authoritative: render each final slide
+    # as its own Beamer frame (latex_utils.render_slide) and assemble them.
     deck = Deck.model_validate(state["deck"])
-    # The post-edit slide content is authoritative. Ask the per-slide LaTeX
-    # agent for each final frame, retain the fragments on the deck, and assemble
-    # those exact fragments for compile and review.
-    ordered = sorted(deck.slides, key=lambda s: s.number)
-    # One independent LaTeX task per final slide; map preserves slide order
-    # while the workers run concurrently.
-    with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as pool:
-        parts = list(pool.map(create_slide_latex, ordered))
-    deck_dict = deck.model_dump()
-    for slide_dict, part in zip(sorted(deck_dict["slides"], key=lambda s: s["number"]), parts):
-        slide_dict["latex_part"] = part
-    latex = render_beamer(deck, state.get("author", ""), state.get("institute", ""), slide_parts=parts)
-    return {"deck": deck_dict, "latex": latex}
+    return {"latex": render_beamer(deck, state.get("author", ""), state.get("institute", ""))}
 
 
 # ----------------------------------------------------------------- reviewer
@@ -668,7 +656,8 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None,
     llm = get_llm(model)
     problems = validate_latex(latex, len(deck.slides))
     if compile_error:
-        problems.append(f"LaTeX compiler failed: {compile_error}")
+        # The tail of the log holds the error; the full log would swamp the prompt.
+        problems.append(f"LaTeX compiler failed: {compile_error[-1500:]}")
     system = (
         "You review a presentation deck and its LaTeX. Output JSON only. "
         "Schema: {\"passed\": bool, \"issues\": [{\"severity\": str, \"slide\": int|null, \"issue\": str, \"fix\": str}], \"summary\": str}. "
@@ -691,8 +680,6 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None,
             + (f"\nChart: {s.chart.title} ({s.chart.chart_type})" if s.chart else "")
             for s in deck.slides
         )
-        + "\n\nAssembled LaTeX source (the exact per-slide fragments compiled for this review):\n"
-        + "```latex\n" + latex + "\n```"
     )
     try:
         result = ReviewResult.model_validate(_chat_json(llm, system, user))

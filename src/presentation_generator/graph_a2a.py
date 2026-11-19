@@ -126,11 +126,8 @@ def make_a2a_graph(urls: dict | None = None):
 
         with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as pool:
             parts = list(pool.map(render_slide, ordered))
-        deck_dict = deck.model_dump()
-        for slide_dict, part in zip(sorted(deck_dict["slides"], key=lambda s: s["number"]), parts):
-            slide_dict["latex_part"] = part
         latex = render_beamer(deck, state.get("author", ""), state.get("institute", ""), slide_parts=parts)
-        return {"deck": deck_dict, "latex": latex}
+        return {"latex": latex}
 
     builder = StateGraph(PresentationState)
     builder.add_node("planner", planner)

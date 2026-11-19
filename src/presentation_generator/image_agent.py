@@ -5,11 +5,12 @@ import json
 import re
 
 from .graph import _chat_json
+from .images import MAX_IMAGES
 from .llm import get_llm
 
 
 def select_relevant_images(deck: dict, candidates: list[dict], model: str | None = None) -> list[dict]:
-    """Return up to five confident, unique article-image/slide assignments."""
+    """Return up to MAX_IMAGES confident, unique article-image/slide assignments."""
     if not candidates:
         return []
     slides = [
@@ -31,7 +32,7 @@ def select_relevant_images(deck: dict, candidates: list[dict], model: str | None
         "You are the presentation image-selection agent. Match only the supplied Wikipedia article images "
         "to slides whose subject they clearly illustrate. Do not infer image contents beyond the file title "
         "and description. Skip weak or generic matches; a slide without an image is better than a misleading one. "
-        "Choose up to five images total when suitable matches exist, each image at most once, "
+        f"Choose up to {MAX_IMAGES} images total when suitable matches exist, each image at most once, "
         "and at most one image per slide. For a city topic, prefer recognizable city-specific "
         "places, streets, skyline, transit, or local culture over generic images. "
         "Return JSON only with schema: {\"selections\":[{\"image_id\":int,\"slide_number\":int,\"confidence\":number,\"reason\":str}]}. "
@@ -64,6 +65,6 @@ def select_relevant_images(deck: dict, candidates: list[dict], model: str | None
         chosen_images.add(image_id)
         chosen_slides.add(slide_number)
         selections.append({"image_id": image_id, "slide_number": slide_number})
-        if len(selections) == 5:
+        if len(selections) == MAX_IMAGES:
             break
     return selections

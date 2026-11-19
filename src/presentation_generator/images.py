@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 API = "https://en.wikipedia.org/w/api.php"
+MAX_IMAGES = 5  # most article images placed in one deck
 USER_AGENT = "MultiAgentPresentationGenerator/1.0 (presentation image sourcing)"
 _STOPWORDS = {
     "the", "and", "with", "from", "into", "about", "what", "when", "where", "why", "how",
@@ -117,7 +118,7 @@ def render_selected_images(deck, output_dir: str, article_title: str, article_ur
     with httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
         used_ids: set[int] = set()
         used_slides: set[int] = set()
-        for selection in selections[:5]:
+        for selection in selections[:MAX_IMAGES]:
             try:
                 image_id = int(selection["image_id"])
                 slide_number = int(selection["slide_number"])

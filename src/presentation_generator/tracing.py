@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
+import warnings
 from contextvars import ContextVar
 from contextlib import contextmanager
 
@@ -127,9 +128,12 @@ def prepare_graph(graph):
         return graph, {}
     try:
         from opik.integrations.langchain import track_langgraph
-
+    except ImportError:  # older opik without graph tracking
+        return graph, {"callbacks": callbacks}
+    try:
         return track_langgraph(graph, callbacks[0]), {}
-    except Exception:
+    except Exception as exc:  # tracing stays best-effort, but say so
+        warnings.warn(f"Opik track_langgraph failed ({exc!r}); falling back to callback tracing.")
         return graph, {"callbacks": callbacks}
 
 
