@@ -24,6 +24,7 @@ without re-testing the import.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import functools
 import os
 import warnings
@@ -167,29 +168,47 @@ def track(name, span_type="general"):
     return lazy_deco
 
 
+_SPAN_CLIENT = None  # one Opik client per process, reused by every span
+
+
+def _span_client():
+    global _SPAN_CLIENT
+    if _SPAN_CLIENT is None:
+        import opik
+
+        _SPAN_CLIENT = opik.Opik(project_name=_PROJECT)
+    return _SPAN_CLIENT
+
+
 @contextlib.contextmanager
 def span(name: str, metadata: dict | None = None):
-    """Explicit Opik span for one agent call (used by the A2A agents,
-    where a decorator would capture the agent object as input). The
-    span is a no-op context manager when tracing is off, and any Opik
-    failure is swallowed — the wrapped work always runs."""
-    trace = None
-    if enabled():
-        try:
-            import opik
+    """Explicit Opik trace for one agent call (used by the A2A agents,
+    where a decorator would capture the agent object as input). A no-op
+    when tracing is off, and any Opik failure is swallowed — the wrapped
+    work always runs.
 
-            client = opik.Opik(project_name=_PROJECT)
-            trace = client.trace(name=name, metadata=metadata or {})
-        except Exception:
-            trace = None
+    The trace is sent once, complete, when the call finishes (start and
+    end time together). Creating it up front and calling Trace.end()
+    a moment later sends a second update, which Opik's batching warns
+    may be lost ("Calling Trace.end() shortly after creation")."""
+    if not enabled():
+        yield
+        return
+    start = datetime.datetime.now(datetime.timezone.utc)
+    meta = dict(metadata or {})
     try:
-        yield trace
+        yield
+    except BaseException as exc:
+        meta["error"] = repr(exc)[:500]
+        raise
     finally:
-        if trace is not None:
-            try:
-                trace.end()
-            except Exception:
-                pass
+        try:
+            _span_client().trace(
+                name=name, start_time=start,
+                end_time=datetime.datetime.now(datetime.timezone.utc), metadata=meta,
+            )
+        except Exception:
+            pass
 
 
 def flush():

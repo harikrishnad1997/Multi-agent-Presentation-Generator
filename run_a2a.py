@@ -60,19 +60,28 @@ def main() -> int:
 
     env = {**os.environ, **env}
     procs: list[subprocess.Popen] = []
+    # Each server's output goes to <out>/agent-logs/<name>.log, so a server
+    # that fails to start (e.g. a missing dependency) explains itself.
+    log_dir = Path(args.out) / "agent-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     try:
         for name in AGENT_CLASSES:
             port = PORTS[name]
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "presentation_generator.a2a_server", "--agent", name, "--port", str(port)],
-                cwd=str(root), env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            with open(log_dir / f"{name}.log", "w", encoding="utf-8") as log:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "presentation_generator.a2a_server", "--agent", name, "--port", str(port)],
+                    cwd=str(root), env=env,
+                    stdout=log, stderr=subprocess.STDOUT,
+                )
             procs.append(proc)
             print(f"Starting presentation-{name} on :{port} ...")
         for name, port in PORTS.items():
             if not _wait_for_card(port):
                 print(f"ERROR: presentation-{name} did not come up on :{port}")
+                log_file = log_dir / f"{name}.log"
+                tail = log_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-15:]
+                if tail:
+                    print(f"Last lines of {log_file}:\n  " + "\n  ".join(tail))
                 return 1
             print(f"  card OK: http://127.0.0.1:{port}/.well-known/agent-card.json")
         comments = ""

@@ -7,9 +7,13 @@ A topic build used to be grounded only in a Wikipedia search
 1. Plan — the LLM turns the topic into 5 research questions
    (origins/history, key facts & numbers, how it works, adoption
    and use cases, challenges & latest developments).
-2. Search — each question is run against Bing web search
-   (no API key; DuckDuckGo's HTML endpoint is unreachable from
-   here) and the top fresh pages are fetched and read as text.
+2. Search — each question is run against Tavily when
+   TAVILY_API_KEY is set (it returns page text directly), else
+   against keyless Bing web search, whose pages are fetched and
+   read as text. Keyless Bing matches loosely (it effectively keys
+   on the first word, so "Google Gemini ..." returns google.com), so
+   every page must pass a topic-relevance check before it is used
+   or cited.
 3. Base — the Wikipedia grounding from search_grounding.py is
    added as the encyclopedic base, so the brief always has the
    definitions and dates even when the open web is thin.
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -42,6 +47,7 @@ MAX_PAGES = 8
 MAX_PAGE_CHARS = 3_000
 MAX_BRIEF_CHARS = 10_000
 MAX_RAW_CHARS = 14_000
+TAVILY_URL = "https://api.tavily.com/search"
 SKIP_DOMAINS = ("youtube.com", "youtu.be", "facebook.com", "instagram.com", "x.com", "twitter.com")
 
 
@@ -108,6 +114,40 @@ def _bing_search(query: str, max_results: int = 5) -> list[tuple[str, str, str]]
     return out
 
 
+def _tavily_search(query: str, api_key: str, max_results: int = 5) -> list[tuple[str, str, str]]:
+    """Tavily search. Returns [(url, title, page_text)]; the text is the
+    page's extracted content, so no separate fetch is needed."""
+    body = json.dumps({
+        "query": query, "max_results": max_results, "search_depth": "basic",
+        "include_raw_content": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(TAVILY_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
+    })
+    with urllib.request.urlopen(req, timeout=TIMEOUT * 2) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    out: list[tuple[str, str, str]] = []
+    for item in data.get("results", []):
+        url = item.get("url") or ""
+        if not url.startswith("http") or any(d in url for d in SKIP_DOMAINS):
+            continue
+        text = re.sub(r"\s+", " ", item.get("raw_content") or item.get("content") or "").strip()
+        out.append((url, item.get("title") or url, text[:MAX_PAGE_CHARS]))
+    return out
+
+
+def _search(query: str) -> list[tuple[str, str, str, str | None]]:
+    """[(url, title, snippet, page_text or None)] — Tavily when keyed, else
+    Bing (whose pages still need fetching, signalled by None)."""
+    api_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if api_key:
+        try:
+            return [(url, title, "", text) for url, title, text in _tavily_search(query, api_key)]
+        except Exception:
+            pass  # fall back to keyless Bing
+    return [(url, title, snippet, None) for url, title, snippet in _bing_search(query)]
+
+
 def _fetch_page(url: str) -> str:
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -168,7 +208,7 @@ def _synthesize(topic: str, excerpts: str, model: str | None) -> str:
 
 
 def research_topic(topic: str, model: str | None = None, shallow: bool = False) -> ResearchResult:
-    from .search_grounding import ground_topic
+    from .search_grounding import _topic_words, ground_topic, is_relevant
 
     if shallow:
         found = ground_topic(topic)
@@ -176,23 +216,29 @@ def research_topic(topic: str, model: str | None = None, shallow: bool = False) 
             brief=found.text, mode="search" if found.found else "none", sources=found.sources,
         )
     queries = _plan_queries(topic, model)
+    terms = _topic_words(topic)
     seen: set[str] = set()
     excerpts: list[str] = []
     sources: list[str] = []
     for query in queries:
+        if len(excerpts) >= MAX_PAGES:
+            break
         try:
-            results = _bing_search(query)
+            results = _search(query)
         except Exception:
             continue
-        for url, title, snippet in results:
-            if url in seen or len(excerpts) >= MAX_PAGES:
+        for url, title, snippet, text in results:
+            if len(excerpts) >= MAX_PAGES:
                 break
+            if url in seen:
+                continue  # already read via an earlier query; the rest of this query's results still count
             seen.add(url)
-            try:
-                text = _fetch_page(url)
-            except Exception:
-                continue
-            if len(text) < 200:
+            if text is None:
+                try:
+                    text = _fetch_page(url)
+                except Exception:
+                    continue
+            if len(text) < 200 or not is_relevant(terms, title, snippet, text):
                 continue
             domain = urllib.parse.urlparse(url).netloc
             excerpts.append(f"--- {title} ({domain}) ---\n{url}\n{text}")
@@ -202,7 +248,10 @@ def research_topic(topic: str, model: str | None = None, shallow: bool = False) 
         found = ground_topic(topic)
         if found.found:
             excerpts.append(f"--- Wikipedia grounding ---\n{found.text}")
-            sources.extend(found.sources)
+            # Labels end in the URL; skip articles the web search already cited.
+            cited = {urllib.parse.unquote(u) for u in seen}
+            sources.extend(src for src in found.sources
+                           if urllib.parse.unquote(src.rsplit(" ", 1)[-1]) not in cited)
     except Exception:
         found = None
     if not excerpts:

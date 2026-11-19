@@ -131,6 +131,16 @@ def _is_ending(title: str) -> bool:
     return any(w in low for w in _ENDING_WORDS)
 
 
+def ending_last(slides: list) -> list:
+    """Return slides in number order with ending slides (Conclusion,
+    Summary, ...) moved after every content slide. Works for SlideBrief
+    and SlideContent. LLM steps renumber slides freely — the 30-slide A2A
+    deck had 'A2A Scalability Considerations' after its Conclusion — so
+    order is enforced here rather than trusted from their numbers."""
+    ordered = sorted(slides, key=lambda s: s.number)
+    return [s for s in ordered if not _is_ending(s.title)] + [s for s in ordered if _is_ending(s.title)]
+
+
 def validate_outline(outline: Outline, n: int, visual_target: int) -> list[str]:
     """Check an outline against the hard rules. Empty list = valid.
 
@@ -160,8 +170,86 @@ def validate_outline(outline: Outline, n: int, visual_target: int) -> list[str]:
     return problems
 
 
-def _fill_briefs(llm, topic: str, title: str, existing_titles: list[str], count: int, start_number: int) -> list[SlideBrief]:
-    """Ask the planner for `count` extra content briefs (never endings)."""
+# Words that may repeat across titles without the slides overlapping
+# ("Case Study: Finance" and "Case Study: Retail" are distinct slides).
+_OVERLAP_IGNORE = {"case", "study", "studies", "key", "overview", "introduction", "part", "continued", "consideration", "considerations"}
+_PLACEHOLDER = re.compile(r"\b(?i:company|organi[sz]ation|client|vendor|firm|customer|enterprise|business)\s+[A-Z]\b|\b(?i:acme|xyz corp)\b")
+
+
+def _content_words(title: str, topic_words: set[str]) -> set[str]:
+    words = {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2}
+    return words - {w.rstrip("s") for w in _TITLE_STOPWORDS | _OVERLAP_IGNORE | topic_words}
+
+
+def outline_flow_problems(outline: Outline, topic: str = "") -> list[str]:
+    """Soft flow checks fed back to the planner on retry (never repaired
+    deterministically). The 30-slide A2A deck shipped 'Communication
+    Protocols' / 'Communication Standards', 'Security Considerations' /
+    'Security Features', 'Integration Challenges' / 'Challenges Faced',
+    and placeholder 'Case Study: Company A / Company B' slides."""
+    topic_words = set(re.findall(r"[a-z0-9]+", f"{topic} {outline.title}".lower()))
+    body = [s for s in outline.slides if not _is_ending(s.title)]
+    problems: list[str] = []
+    words = [(s, _content_words(s.title, topic_words)) for s in body]
+    for i, (a, wa) in enumerate(words):
+        for b, wb in words[i + 1:]:
+            shared = wa & wb
+            if shared:
+                problems.append(
+                    f"Slides '{a.title}' and '{b.title}' overlap (both about {', '.join(sorted(shared))}): "
+                    "merge them or give each a clearly distinct sub-topic.")
+    for slide in outline.slides:
+        if _PLACEHOLDER.search(f"{slide.title} {slide.brief}"):
+            problems.append(
+                f"Slide '{slide.title}' uses a placeholder name (e.g. 'Company A'): name a real organization "
+                "from the source material, or replace the slide with a different sub-topic.")
+    return problems
+
+
+def resolve_overlaps(outline: Outline, topic: str, llm, source_text: str = "") -> Outline:
+    """Replace each slide that overlaps an EARLIER slide (shared title
+    theme) or uses a placeholder name with a fresh, distinct brief, in
+    the same position and keeping its chart slot. Runs once the planner's
+    own retries still leave flow problems — it ignored the feedback for
+    'Future of A2A' / 'Future Challenges' / 'Potential for Future
+    Protocols' and 'Community Support' / 'Community Contributions'."""
+    topic_words = set(re.findall(r"[a-z0-9]+", f"{topic} {outline.title}".lower()))
+    covered: set[str] = set()
+    replace: list[SlideBrief] = []
+    for slide in outline.slides:
+        if _is_ending(slide.title):
+            continue
+        words = _content_words(slide.title, topic_words)
+        if (words & covered) or _PLACEHOLDER.search(f"{slide.title} {slide.brief}"):
+            replace.append(slide)
+        else:
+            covered |= words
+    if not replace:
+        return outline
+    keep_titles = [s.title for s in outline.slides if s not in replace]
+    try:
+        fresh = _fill_briefs(llm, topic, outline.title, keep_titles, len(replace), 0,
+                             avoid_words=sorted(covered), source_text=source_text)
+    except Exception:
+        return outline  # best effort: an overlapping deck beats a broken plan
+    accepted: dict[int, SlideBrief] = {}
+    for old, new in zip(replace, fresh):
+        words = _content_words(new.title, topic_words)
+        if words & covered or _is_ending(new.title):
+            continue  # still overlaps: keep the original slide
+        covered |= words
+        new.number, new.has_visual = old.number, old.has_visual
+        new.visual_hint = f"Quantitative comparison or trend for: {new.title}" if old.has_visual else ""
+        accepted[old.number] = new
+    slides = [accepted.get(s.number, s) for s in outline.slides]
+    return outline.model_copy(update={"slides": slides})
+
+
+def _fill_briefs(llm, topic: str, title: str, existing_titles: list[str], count: int, start_number: int,
+                 avoid_words: list[str] | None = None, source_text: str = "") -> list[SlideBrief]:
+    """Ask the planner for `count` extra content briefs (never endings).
+    avoid_words: themes already covered, which new titles must not reuse.
+    source_text: research/source material the new briefs must stay within."""
     system = (
         "You plan presentations. Output JSON only. "
         "Schema: {\"slides\": [{\"number\": int, \"title\": str, \"brief\": str, \"key_points\": [str], "
@@ -171,6 +259,11 @@ def _fill_briefs(llm, topic: str, title: str, existing_titles: list[str], count:
         "Keep titles short (<= 8 words), briefs to 1-2 sentences."
     )
     user = f"Topic: {topic}\nExisting titles (do not repeat): {', '.join(existing_titles)}"
+    if avoid_words:
+        user += ("\nThese themes are already covered — each new slide must be about something else, and its "
+                 f"title must not use any of these words: {', '.join(avoid_words)}")
+    if source_text:
+        user += f"\n\nBase every new slide on facts in this source material only:\n{source_text}"
     data = _chat_json(llm, system, user)
     briefs = [SlideBrief.model_validate(b) for b in data.get("slides", [])]
     for i, b in enumerate(briefs):
@@ -198,10 +291,11 @@ def _repair_outline(outline: Outline, n: int, visual_target: int, llm=None, topi
         kept.append(s)
     # Exactly one ending slide, at the end.
     endings = [s for s in kept if _is_ending(s.title)]
-    if len(endings) > 1:
-        keep_end = endings[-1]
-        kept = [s for s in kept if not _is_ending(s.title)] + [keep_end]
-    elif len(endings) == 0 and kept:
+    if endings:
+        # Exactly one ending, and it goes last — also when there is only
+        # one but it sits mid-deck.
+        kept = [s for s in kept if not _is_ending(s.title)] + [endings[-1]]
+    elif kept:
         kept[-1].title = "Conclusion and Summary"
     # Visual count: turn off extras, then turn on evenly-spaced slides.
     visuals = [s for s in kept if s.has_visual and not _is_ending(s.title)]
@@ -253,7 +347,11 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
         f"Produce exactly {n} slides. "
         "The last slide, and ONLY the last slide, must be a conclusion / summary. "
         "Do not add any other ending-like slides (no separate Summary, Takeaways, Final Thoughts, or Looking Ahead slides). "
-        "All other slides must be distinct content slides with distinct titles. "
+        "All other slides must be distinct content slides with distinct titles, each covering a different "
+        "sub-topic: never two slides on the same theme (e.g. not both 'Security Features' and "
+        "'Security Considerations' — make one 'Security' slide). Order slides so each builds on the last. "
+        "Never use placeholder names like 'Company A' or 'Organization X'; a case-study slide must name "
+        "a real organization from the source material, and if there is none, choose another sub-topic. "
         "Keep titles short (<= 8 words) and briefs to 1-2 sentences. "
         f"Mark exactly {visual_target} slides has_visual=true, spread through the deck, never the last slide. "
         "Each visual slide needs a visual_hint naming a real quantitative comparison, trend, or share "
@@ -277,20 +375,30 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
         )
     outline: Outline | None = None
     problems: list[str] = []
+    flow: list[str] = []
+    base_user = user
     for _attempt in range(3):
-        if problems:
+        if problems or flow:
+            # Keep the source material and review feedback on retries: a
+            # retry without them planned from model knowledge alone, which
+            # is how ungrounded 'Company A' slides reached the deck.
             user = (
-                f"Topic: {topic}\nAuthor: {author}\n"
-                f"Your previous outline failed validation:\n" + "\n".join(f"- {p}" for p in problems) +
-                "\nFix every problem above and return a corrected outline, JSON only."
+                base_user + "\n\nYour previous outline had these problems:\n"
+                + "\n".join(f"- {p}" for p in problems + flow)
+                + "\nFix every problem above and return a corrected outline, JSON only."
             )
         outline = Outline.model_validate(_chat_json(llm, system, user))
         problems = validate_outline(outline, n, visual_target)
-        if not problems:
+        flow = outline_flow_problems(outline, topic)
+        if not problems and not flow:
             break
     assert outline is not None
+    # Only the hard rules are repaired; leftover flow problems are left to
+    # the editor and reviewer rather than forcing a mechanical fix.
     if problems:
         outline = _repair_outline(outline, n, visual_target, llm=llm, topic=topic)
+    if outline_flow_problems(outline, topic):
+        outline = resolve_overlaps(outline, topic, llm, source_text=source_text)
     return outline
 
 
@@ -407,7 +515,41 @@ def _slide_text(s: SlideContent) -> str:
     return text
 
 
-def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, review_issues: str = "", topic: str = "", num_slides: int | None = None, source_material: str = "") -> Deck:
+_BULLET_STOPWORDS = _TITLE_STOPWORDS | {"is", "are", "be", "by", "as", "its", "it", "this", "that", "can", "include", "includes", "including", "such", "like", "use", "uses"}
+BULLET_OVERLAP = 0.5  # token Jaccard at which two bullets count as the same point
+
+
+def _bullet_tokens(text: str, topic_words: set[str]) -> set[str]:
+    words = {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 2}
+    return words - {w.rstrip("s") for w in _BULLET_STOPWORDS | topic_words}
+
+
+def drop_repeated_bullets(slides: list[SlideContent], topic_words: set[str], min_bullets: int = 3) -> list[SlideContent]:
+    """Drop a bullet that repeats a point made on an EARLIER slide (token
+    Jaccard >= BULLET_OVERLAP, topic words ignored), as long as the slide
+    keeps min_bullets. The 30-slide A2A deck failed review on 'signed
+    agent cards for identity verification' appearing on slides 20 and 21,
+    even though the chunk editor saw both."""
+    seen: list[set[str]] = []
+    for slide in sorted(slides, key=lambda s: s.number):
+        if slide.title.strip().lower().startswith("references"):
+            continue
+        kept: list[str] = []
+        tokens_kept: list[set[str]] = []
+        for i, bullet in enumerate(slide.bullets):
+            tokens = _bullet_tokens(bullet, topic_words)
+            repeat = bool(tokens) and any(len(tokens & t) / len(tokens | t) >= BULLET_OVERLAP for t in seen)
+            remaining = len(slide.bullets) - i - 1
+            if repeat and len(kept) + remaining >= min_bullets:
+                continue  # drop: the point was already made, and the slide stays full enough
+            kept.append(bullet)
+            tokens_kept.append(tokens)
+        slide.bullets = kept
+        seen.extend(tokens_kept)
+    return slides
+
+
+def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, review_issues: str = "", topic: str = "", num_slides: int | None = None, source_material: str = "", source_text: str = "") -> Deck:
     """Edit a deck in order; fix flow, duplication, ordering, tone.
 
     Chunked in groups of 6 slides: a 30-slide deck regenerated in one
@@ -431,7 +573,7 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         "a duplicate must be removed, not rewritten. Otherwise keep every slide. "
         "Your jobs: (1) cut or rewrite any point duplicated within the chunk or with the neighbouring slides; "
         "(2) add a transition where a jump feels abrupt — fold it into the next slide's first bullet or its notes; "
-        "(3) even out tone and bullet length; (4) every slide keeps 3-5 bullets and 1-3 sentences of notes; "
+        "(3) even out tone and bullet length; never keep a point that the rest of the deck already makes; (4) every slide keeps 3-5 bullets and 1-3 sentences of notes; "
         "(5) preserve each chart exactly by default, but obey an explicit user request to change a chart's type, title, labels, or placement. "
         "Never invent or alter numeric values unless the user supplied them in the request or source material; "
         "when a requested trend needs missing time-series values, keep the existing values and say what data is needed. "
@@ -449,7 +591,13 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
             neighbours.append("Previous slide (for duplication check):\n" + _slide_text(slides[start - 1]))
         if start + chunk_size < len(slides):
             neighbours.append("Next slide (for duplication check):\n" + _slide_text(slides[start + chunk_size]))
-        user = f"Presentation: {outline.title}\nStyle: {outline.style_guide}\n" + "\n\n".join(neighbours) + f"\n\n{chunk_text}"
+        # The rest of the deck, compactly: a chunk editor that only sees its
+        # neighbours cannot tell a point is already made 10 slides earlier.
+        others = [x for x in slides if x not in chunk]
+        deck_map = "\n".join(f"Slide {x.number}: {x.title} — " + " | ".join(x.bullets) for x in others)
+        user = (f"Presentation: {outline.title}\nStyle: {outline.style_guide}\n"
+                + (f"Rest of the deck (do not repeat any point made there):\n{deck_map}\n\n" if deck_map else "")
+                + "\n\n".join(neighbours) + f"\n\n{chunk_text}")
         if issues:
             user += f"\n\nReviewer issues from the previous round — fix all that apply to this chunk:\n{issues}"
         if source_material:
@@ -458,13 +606,20 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
                      "invent facts:\n" + source_material)
         try:
             fragment = Deck.model_validate(_chat_json(llm, system, user))
-            edited.extend(fragment.slides)
+            # Trust the chunk's order, not its numbers: the LLM often
+            # renumbers a chunk from 1, and sorting the whole deck by those
+            # numbers interleaved chunks (the 30-slide A2A deck put its
+            # Conclusion at slide 19).
+            edited.extend(sorted(fragment.slides, key=lambda x: x.number))
         except Exception:
             edited.extend(chunk)  # editor failure must not lose slides
+    for position, slide in enumerate(edited, start=1):
+        slide.number = position
     # Deterministic dedupe: same title twice (normalised — "Gemini
     # Pricing Tiers" and "Pricing Tiers" are the same slide), or
     # near-identical bullets.
-    topic_words = set(re.findall(r"[a-z0-9]+", outline.title.lower()))
+    topic_words = set(re.findall(r"[a-z0-9]+", f"{topic} {outline.title}".lower()))
+    edited = drop_repeated_bullets(edited, topic_words)
     deduped: list[SlideContent] = []
     seen_titles: set[str] = set()
     for s in sorted(edited, key=lambda x: x.number):
@@ -491,7 +646,7 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
             for brief in extra_briefs:
                 prev_t = body[-1].title if body else ""
                 next_t = ending.title if ending else ""
-                body.append(write_one_slide(brief, outline, prev_t, next_t, model))
+                body.append(write_one_slide(brief, outline, prev_t, next_t, model, source_text=source_text))
             edited = body + ([ending] if ending else [])
         except Exception:
             pass
@@ -516,10 +671,11 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         ending = endings[-1] if endings else None
         body = [s for s in edited if not _is_ending(s.title)]
         edited = (body[: target - 1] + [ending]) if ending is not None else body[:target]
-    # Normalise numbering in final order.
-    for i, slide in enumerate(sorted(edited, key=lambda s: s.number), start=1):
+    # Normalise numbering in final order, the ending slide always last.
+    edited = ending_last(edited)
+    for i, slide in enumerate(edited, start=1):
         slide.number = i
-    return Deck(title=outline.title, slides=sorted(edited, key=lambda s: s.number))
+    return Deck(title=outline.title, slides=edited)
 
 
 def editor(state: PresentationState) -> dict:
@@ -533,7 +689,10 @@ def editor(state: PresentationState) -> dict:
         # Only this build's slides: the accumulator still holds the
         # failed attempts' slides (see write_slide's build_attempt tag).
         current = state.get("build_attempt", 1)
-        raw = [s for s in state.get("slides", []) if s.get("build_attempt", current) == current]
+        # Strict match: an untagged slide is never this build's. The old
+        # default (untagged == current) let every earlier build's edited
+        # slides back in after a restart, mixing builds in one deck.
+        raw = [s for s in state.get("slides", []) if s.get("build_attempt") == current]
         slides = [SlideContent.model_validate(s) for s in raw]
     comments_raw = state.get("comments", "")
     if comments_raw:
@@ -550,8 +709,12 @@ def editor(state: PresentationState) -> dict:
             review_issues=state.get("review_issues", ""),
             topic=state.get("topic", ""),
             num_slides=state.get("num_slides"),
+            source_text=state.get("source_text", ""),
         )
-    return {"deck": deck.model_dump(), "slides": [s.model_dump() for s in deck.slides]}
+    # Only the deck: the slides channel is an append-only accumulator of
+    # writer output, and writing edited (untagged) slides back into it
+    # leaked them into the next build after a restart.
+    return {"deck": deck.model_dump()}
 
 
 # ------------------------------------------------------------------ charts
@@ -616,6 +779,13 @@ def render_images(state: PresentationState) -> dict:
     return {"deck": deck.model_dump(), "image_count": count}
 
 
+REFS_PER_SLIDE = 4
+
+
+def _is_references(slide: SlideContent) -> bool:
+    return slide.title.strip().lower().startswith("references")
+
+
 def add_references(state: PresentationState) -> dict:
     """Append a references slide, including research, supplied, and image sources."""
     deck = Deck.model_validate(state["deck"])
@@ -627,10 +797,11 @@ def add_references(state: PresentationState) -> dict:
     refs = list(dict.fromkeys(ref.strip() for ref in refs if ref.strip()))
     if not refs:
         refs = ["No external sources supplied; content generated from model knowledge."]
-    deck.slides = [s for s in deck.slides if not s.title.strip().lower().startswith("references")]
+    deck.slides = [s for s in deck.slides if not _is_references(s)]
     # Keep each citation frame short enough to fit while preserving every source.
-    for chunk_index, start in enumerate(range(0, len(refs), 4)):
-        title = "References" if chunk_index == 0 else f"References (continued {chunk_index + 1})"
+    starts = range(0, len(refs), REFS_PER_SLIDE)
+    for chunk_index, start in enumerate(starts):
+        title = "References" if len(starts) == 1 else f"References ({chunk_index + 1} of {len(starts)})"
         deck.slides.append(SlideContent(
             number=len(deck.slides) + 1,
             title=title,
@@ -662,7 +833,6 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None,
         "You review a presentation deck and its LaTeX. Output JSON only. "
         "Schema: {\"passed\": bool, \"issues\": [{\"severity\": str, \"slide\": int|null, \"issue\": str, \"fix\": str}], \"summary\": str}. "
         "Check: each slide has 3-5 bullets, notes present, no duplicated points, titles match content, "
-        "except References slides, which list citations; preserve every citation exactly. "
         "no factual howlers, no empty slides. Severity is one of critical, major, minor. "
         "Use critical ONLY for duplicated content, empty slides, wrong titles, or invalid LaTeX/charts. "
         "'Lacks detail' or 'lacks timelines' is major at most, never critical. "
@@ -678,14 +848,17 @@ def review_deck(deck: Deck, latex: str, chart_count: int, model: str | None,
         + "\n\n".join(
             f"Slide {s.number}: {s.title}\n" + "\n".join(f"- {b}" for b in s.bullets)
             + (f"\nChart: {s.chart.title} ({s.chart.chart_type})" if s.chart else "")
-            for s in deck.slides
+            for s in deck.slides if not _is_references(s)
         )
     )
     try:
         result = ReviewResult.model_validate(_chat_json(llm, system, user))
     except Exception:
         result = ReviewResult(passed=not problems, summary="LLM review failed; relying on structural checks.")
-    issues = list(result.issues)
+    # References slides are built deterministically from the source list, so
+    # they are left out of the LLM review (it read the split as duplication).
+    reference_numbers = {s.number for s in deck.slides if _is_references(s)}
+    issues = [i for i in result.issues if i.slide not in reference_numbers]
     for problem in problems:
         issues.insert(0, ReviewIssue(severity="critical", issue=problem, fix="Fix the LaTeX rendering."))
     if problems:

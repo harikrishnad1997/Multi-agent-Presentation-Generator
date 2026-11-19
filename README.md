@@ -88,7 +88,9 @@ The agents publish Agent Cards and listen on ports 8101–8106 by default. See `
 
 ### Research and search options
 
-Deep research runs by default for topic-based decks. To use quick Wikipedia grounding or turn grounding off:
+Deep research runs by default for topic-based decks. It searches the web with [Tavily](https://tavily.com) when `TAVILY_API_KEY` is set, and otherwise falls back to keyless Bing search, which finds far fewer on-topic pages. Either way, a page is only used and cited if it actually mentions the topic. Keys can be exported in your shell or put in a `.env` file (see `.env.example`), which is loaded automatically.
+
+To use quick Wikipedia grounding or turn grounding off:
 
 ```bash
 python main.py --topic "Quantum computing" --shallow --slides 8 --out out/quantum

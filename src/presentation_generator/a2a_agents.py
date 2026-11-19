@@ -162,6 +162,7 @@ class EditorAgent(_JsonAgent):
                 review_issues=payload.get("review_issues", ""),
                 topic=payload.get("topic", ""),
                 num_slides=payload.get("num_slides"),
+                source_text=payload.get("source_text", ""),
             )
         return {"deck": deck.model_dump()}
 
