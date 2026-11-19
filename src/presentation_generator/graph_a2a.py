@@ -2,17 +2,19 @@
 step is an A2A call over HTTP instead of an in-process function call.
 
 LangGraph still owns the flow — planner -> Send fan-out to writers
--> editor -> charts -> LaTeX -> reviewer -> compile — but each node
+-> editor -> charts -> LaTeX assembly -> pre-review compile -> reviewer
+-> final artifacts — but each agent node
 is now an A2A client: it resolves the agent's Card, sends a Message
 with the JSON payload, and reads the Task artifact back. Agents run
 as separate servers (see a2a_server.py / run_a2a.py) and can be
 swapped, restarted, or reused independently of the orchestrator.
-LaTeX rendering and compilation stay local and deterministic; they
-are not agents, they are tools.
+LaTeX frame rendering is handled by a dedicated deterministic A2A agent;
+document assembly and compilation stay in the orchestrator.
 """
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
@@ -23,10 +25,11 @@ from .graph import (
     MAX_ATTEMPTS,
     PresentationState,
     compile_output,
+    compile_check,
     add_references,
-    render_latex,
     route_reviewer,
 )
+from .latex_utils import render_beamer
 from .models import Deck, Outline, ReviewResult, SlideContent
 
 DEFAULT_URLS = {name: f"http://127.0.0.1:{port}/" for name, port in PORTS.items()}
@@ -49,7 +52,7 @@ def make_a2a_graph(urls: dict | None = None):
         })
         return {
             "outline": result["outline"], "attempts": 0, "slides": [],
-            "deck": {}, "latex": "", "chart_count": 0, "review_issues": "",
+            "deck": {}, "latex": "", "chart_count": 0, "review_issues": "", "compile_error": "",
             "build_attempt": state.get("build_attempt", 0) + 1,
         }
 
@@ -103,6 +106,7 @@ def make_a2a_graph(urls: dict | None = None):
             "deck": state["deck"], "latex": state.get("latex", ""),
             "chart_count": state.get("chart_count", 0), "model": state.get("model"),
             "author": state.get("author", ""), "institute": state.get("institute", ""),
+            "compile_error": state.get("compile_error", ""),
         })
         review = ReviewResult.model_validate(result["review"])
         attempts = state.get("attempts", 0) + 1
@@ -112,6 +116,19 @@ def make_a2a_graph(urls: dict | None = None):
             "review_issues": json.dumps([i.model_dump() for i in review.issues], indent=2),
         }
 
+    def render_latex(state: PresentationState) -> dict:
+        deck = Deck.model_validate(state["deck"])
+        ordered = sorted(deck.slides, key=lambda s: s.number)
+        # Launch one independent A2A LaTeX task per final slide. Executor.map
+        # returns in input order, so assembly stays deterministic.
+        def render_slide(slide: SlideContent) -> str:
+            return call_agent_sync(base["latex"], {"slide": slide.model_dump()})["latex_part"]
+
+        with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as pool:
+            parts = list(pool.map(render_slide, ordered))
+        latex = render_beamer(deck, state.get("author", ""), state.get("institute", ""), slide_parts=parts)
+        return {"latex": latex}
+
     builder = StateGraph(PresentationState)
     builder.add_node("planner", planner)
     builder.add_node("write_slide", write_slide)
@@ -119,6 +136,7 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_node("render_charts", render_charts)
     builder.add_node("add_references", add_references)
     builder.add_node("render_latex", render_latex)
+    builder.add_node("compile_check", compile_check)
     builder.add_node("reviewer", reviewer)
     builder.add_node("compile", compile_output)
 
@@ -128,7 +146,8 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_edge("editor", "render_charts")
     builder.add_edge("render_charts", "add_references")
     builder.add_edge("add_references", "render_latex")
-    builder.add_edge("render_latex", "reviewer")
+    builder.add_edge("render_latex", "compile_check")
+    builder.add_edge("compile_check", "reviewer")
     builder.add_conditional_edges("reviewer", route_reviewer, {"compile": "compile", "restart": "planner"})
     builder.add_edge("compile", END)
     return builder.compile()
@@ -139,7 +158,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
             charts_enabled: bool = True, urls: dict | None = None,
             source_text: str = "", comments: str = "", search: bool = True,
             shallow: bool = False) -> dict:
-    from .tracing import flush, get_callbacks
+    from .tracing import flush, prepare_graph
 
     grounding = {"mode": "source", "sources": []}
     references: list[str] = []
@@ -157,6 +176,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
         grounding = {"mode": "none", "sources": []}
 
     graph = make_a2a_graph(urls)
+    graph, trace_config = prepare_graph(graph)
     initial: PresentationState = {
         "topic": topic, "author": author, "institute": institute,
         "num_slides": num_slides, "model": model or "", "output_dir": output_dir,
@@ -164,10 +184,9 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
         "source_text": source_text, "comments": comments, "references": references,
     }
     try:
-        # Same OpikTracer callback as the in-process run: it traces the
-        # orchestrator's nodes and LLM calls. Each A2A agent also traces
+        # Capture the orchestrator graph and spans. Each A2A agent also traces
         # its own span server-side (see a2a_agents._JsonAgent).
-        result = graph.invoke(initial, config={"callbacks": get_callbacks()})
+        result = graph.invoke(initial, config=trace_config)
         result["grounding"] = grounding
         return result
     finally:

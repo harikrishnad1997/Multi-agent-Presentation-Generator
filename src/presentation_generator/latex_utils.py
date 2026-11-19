@@ -42,8 +42,49 @@ def escape_latex(text: str) -> str:
     return out
 
 
-def render_beamer(deck: Deck, author: str, institute: str, theme: str = "Madrid") -> str:
-    """Render a Deck as a complete Beamer document."""
+def render_slide(slide) -> str:
+    """Render one validated slide as a Beamer frame (a writer's LaTeX part)."""
+    lines: list[str] = []
+    is_references = slide.title.strip().lower().startswith("references")
+    frame_options = "[fragile]" if is_references else ""
+    lines.append(rf"\begin{{frame}}{frame_options}{{{escape_latex(slide.title)}}}")
+    if slide.image_file and not slide.chart_file:
+        lines.extend([r"  \begin{columns}[T]", r"    \begin{column}{0.58\textwidth}"])
+    lines.append(r"  \begin{itemize}")
+    if is_references:
+        lines.append(r"    \footnotesize")
+    for bullet in slide.bullets:
+        if is_references:
+            match = re.search(r"https?://\S+", bullet)
+            if match:
+                label = bullet[:match.start()].rstrip(" —:-")
+                url = match.group(0).rstrip(".,;)")
+                lines.append(rf"    \item {escape_latex(label)}\par \url{{{url}}}")
+            else:
+                lines.append(rf"    \item {escape_latex(bullet)}")
+        else:
+            lines.append(rf"    \item {escape_latex(bullet)}")
+    lines.append(r"  \end{itemize}")
+    if slide.image_file and not slide.chart_file:
+        lines.extend([r"    \end{column}", r"    \begin{column}{0.38\textwidth}", r"      \centering"])
+        lines.append(rf"      \includegraphics[width=\linewidth,height=0.48\textheight,keepaspectratio]{{{slide.image_file}}}")
+        if slide.image_source:
+            lines.append(rf"      \par \tiny{{Source: {escape_latex(slide.image_source)}}}")
+        lines.extend([r"    \end{column}", r"  \end{columns}"])
+    if slide.chart_file:
+        lines.extend([r"  \begin{center}", rf"    \includegraphics[width=0.72\textwidth]{{{slide.chart_file}}}"])
+        if slide.chart and slide.chart.source_note:
+            lines.append(rf"    \par \tiny{{{escape_latex(slide.chart.source_note)}}}")
+        lines.append(r"  \end{center}")
+    if slide.notes.strip():
+        lines.append(rf"  \note{{{escape_latex(slide.notes)}}}")
+    lines.extend([r"\end{frame}", ""])
+    return "\n".join(lines)
+
+
+def render_beamer(deck: Deck, author: str, institute: str, theme: str = "Madrid",
+                  slide_parts: list[str] | None = None) -> str:
+    """Render a Deck as a complete Beamer document from per-slide parts."""
     lines: list[str] = [
         r"\documentclass{beamer}",
         rf"\usetheme{{{theme}}}",
@@ -60,47 +101,9 @@ def render_beamer(deck: Deck, author: str, institute: str, theme: str = "Madrid"
         r"\end{frame}",
         "",
     ]
-    for slide in sorted(deck.slides, key=lambda s: s.number):
-        is_references = slide.title.strip().lower().startswith("references")
-        frame_options = "[fragile]" if is_references else ""
-        lines.append(rf"\begin{{frame}}{frame_options}{{{escape_latex(slide.title)}}}")
-        if slide.image_file and not slide.chart_file:
-            lines.append(r"  \begin{columns}[T]")
-            lines.append(r"    \begin{column}{0.58\textwidth}")
-        lines.append(r"  \begin{itemize}")
-        if is_references:
-            lines.append(r"    \footnotesize")
-        for bullet in slide.bullets:
-            if is_references:
-                match = re.search(r"https?://\S+", bullet)
-                if match:
-                    label = bullet[:match.start()].rstrip(" —:-")
-                    url = match.group(0).rstrip(".,;)")
-                    lines.append(rf"    \item {escape_latex(label)}\par \url{{{url}}}")
-                else:
-                    lines.append(rf"    \item {escape_latex(bullet)}")
-            else:
-                lines.append(rf"    \item {escape_latex(bullet)}")
-        lines.append(r"  \end{itemize}")
-        if slide.image_file and not slide.chart_file:
-            lines.append(r"    \end{column}")
-            lines.append(r"    \begin{column}{0.38\textwidth}")
-            lines.append(r"      \centering")
-            lines.append(rf"      \includegraphics[width=\linewidth,height=0.48\textheight,keepaspectratio]{{{slide.image_file}}}")
-            if slide.image_source:
-                lines.append(rf"      \par \tiny{{Source: {escape_latex(slide.image_source)}}}")
-            lines.append(r"    \end{column}")
-            lines.append(r"  \end{columns}")
-        if slide.chart_file:
-            lines.append(r"  \begin{center}")
-            lines.append(rf"    \includegraphics[width=0.72\textwidth]{{{slide.chart_file}}}")
-            if slide.chart and slide.chart.source_note:
-                lines.append(rf"    \par \tiny{{{escape_latex(slide.chart.source_note)}}}")
-            lines.append(r"  \end{center}")
-        if slide.notes.strip():
-            lines.append(rf"  \note{{{escape_latex(slide.notes)}}}")
-        lines.append(r"\end{frame}")
-        lines.append("")
+    ordered = sorted(deck.slides, key=lambda s: s.number)
+    parts = slide_parts or [render_slide(slide) for slide in ordered]
+    lines.extend(part.rstrip("\n") for part in parts)
     lines.append(r"\end{document}")
     return "\n".join(lines) + "\n"
 

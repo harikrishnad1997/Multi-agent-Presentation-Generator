@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
+import warnings
 from contextvars import ContextVar
 from contextlib import contextmanager
 
@@ -113,6 +114,27 @@ def get_callbacks() -> list:
         return [RequestOpikTracer(project_name=_PROJECT)]
     except Exception:
         return []
+
+
+def prepare_graph(graph):
+    """Attach Opik to a compiled LangGraph and return its invoke config.
+
+    ``track_langgraph`` records the compiled graph structure as well as run
+    spans. Keep the callback-only path as a compatibility fallback so tracing
+    remains best-effort if graph wrapping is unavailable.
+    """
+    callbacks = get_callbacks()
+    if not callbacks:
+        return graph, {}
+    try:
+        from opik.integrations.langchain import track_langgraph
+    except ImportError:  # older opik without graph tracking
+        return graph, {"callbacks": callbacks}
+    try:
+        return track_langgraph(graph, callbacks[0]), {}
+    except Exception as exc:  # tracing stays best-effort, but say so
+        warnings.warn(f"Opik track_langgraph failed ({exc!r}); falling back to callback tracing.")
+        return graph, {"callbacks": callbacks}
 
 
 def track(name, span_type="general"):

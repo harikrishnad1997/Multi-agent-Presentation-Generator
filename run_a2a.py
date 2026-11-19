@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the presentation pipeline over A2A.
 
-Starts the five A2A agent servers (planner 8101, writer 8102,
-editor 8103, chart 8104, reviewer 8105), waits for their Agent
+Starts the A2A agent servers (planner 8101, writer 8102,
+editor 8103, chart 8104, reviewer 8105, per-slide LaTeX 8106), waits for their Agent
 Cards, runs the LangGraph orchestrator as an A2A client, then
 shuts the servers down.
 
