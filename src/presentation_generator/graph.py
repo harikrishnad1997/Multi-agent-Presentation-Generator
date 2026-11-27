@@ -176,7 +176,15 @@ def validate_outline(outline: Outline, n: int, visual_target: int) -> list[str]:
 
 # Words that may repeat across titles without the slides overlapping
 # ("Case Study: Finance" and "Case Study: Retail" are distinct slides).
-_OVERLAP_IGNORE = {"case", "study", "studies", "key", "overview", "introduction", "part", "continued", "consideration", "considerations"}
+_OVERLAP_IGNORE = {"case", "study", "studies", "key", "overview", "part", "continued", "consideration", "considerations"}
+# Words for the protocol's introduction and backstory, counted as one theme:
+# every such slide retells who launched it and when. v11 ('Introduction by
+# Google' vs 'A2A Launch Timeline') and v13 ('Introduction to A2A History'
+# vs 'Introduction to A2A Protocol') failed review on that repeat, and the
+# titles shared no other word.
+_ORIGIN_WORDS = {"introduction", "introducing", "intro", "history", "historical", "origin", "origins",
+                 "launch", "launched", "timeline", "background", "genesis", "beginnings"}
+_ORIGIN_THEME = "origins"
 _PLACEHOLDER = re.compile(r"\b(?i:company|organi[sz]ation|client|vendor|firm|customer|enterprise|business)\s+[A-Z]\b|\b(?i:acme|xyz corp)\b")
 
 
@@ -195,7 +203,8 @@ def _stem(word: str) -> str:
 
 
 def _content_words(title: str, topic_words: set[str]) -> set[str]:
-    words = {_stem(w) for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2}
+    raw = {w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2}
+    words = {_ORIGIN_THEME if w in _ORIGIN_WORDS else _stem(w) for w in raw}
     return words - {_stem(w) for w in _TITLE_STOPWORDS | _OVERLAP_IGNORE | topic_words}
 
 
