@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from presentation_generator.a2a_agents import AGENT_CLASSES, PORTS  # noqa: E402
+from presentation_generator.graph import MAX_ATTEMPTS  # noqa: E402
 from presentation_generator.graph_a2a import run_a2a  # noqa: E402
 from presentation_generator.sources import load_source  # noqa: E402
 from presentation_generator.tracing import status_line  # noqa: E402
@@ -111,7 +112,7 @@ def main() -> int:
         elapsed = time.time() - started
         deck = result.get("deck", {})
         review = result.get("review", {})
-        print(f"\nDone in {elapsed:.0f}s — {len(deck.get('slides', []))} slides, {result.get('chart_count', 0)} charts, review rounds: {result.get('attempts')}, passed: {review.get('passed')}")
+        print(f"\nDone in {elapsed:.0f}s — {len(deck.get('slides', []))} slides, {result.get('chart_count', 0)} charts, build {result.get('build_attempt')} of {MAX_ATTEMPTS}, passed: {review.get('passed')}")
         for slide in deck.get("slides", []):
             chart = " + chart" if slide.get("chart_file") else ""
             print(f"  {slide['number']}. {slide['title']} ({len(slide.get('bullets', []))} bullets{chart})")
