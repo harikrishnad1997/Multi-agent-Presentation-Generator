@@ -47,6 +47,34 @@ MAX_PAGES = 8
 MAX_PAGE_CHARS = 3_000
 MAX_BRIEF_CHARS = 10_000
 MAX_RAW_CHARS = 14_000
+# Larger decks need more distinct material: 8 sources gave a 30-slide
+# deck too little, and the planner padded it with repeated 'Overview' /
+# 'Future' / 'Community' slides (v8, v9). Budgets grow with the slide
+# count up to these caps; decks of up to 15 slides keep the defaults.
+MAX_QUERIES_CAP = 12
+MAX_PAGES_CAP = 20
+BRIEF_CHARS_PER_SLIDE = 600
+
+
+@dataclass(frozen=True)
+class ResearchBudget:
+    queries: int = 5
+    pages: int = MAX_PAGES
+    raw_chars: int = MAX_RAW_CHARS
+    brief_chars: int = MAX_BRIEF_CHARS
+
+
+def research_budget(num_slides: int | None) -> ResearchBudget:
+    n = num_slides or 0
+    pages = min(MAX_PAGES_CAP, max(MAX_PAGES, -(-n // 2)))
+    return ResearchBudget(
+        queries=min(MAX_QUERIES_CAP, max(5, -(-n // 3))),
+        pages=pages,
+        raw_chars=MAX_RAW_CHARS * pages // MAX_PAGES,
+        brief_chars=max(MAX_BRIEF_CHARS, n * BRIEF_CHARS_PER_SLIDE),
+    )
+
+
 TAVILY_URL = "https://api.tavily.com/search"
 SKIP_DOMAINS = ("youtube.com", "youtu.be", "facebook.com", "instagram.com", "x.com", "twitter.com")
 
@@ -164,19 +192,25 @@ def _chat_json(llm, system: str, user: str) -> dict:
     return json.loads(match.group(0)) if match else {}
 
 
-def _plan_queries(topic: str, model: str | None) -> list[str]:
+def _plan_queries(topic: str, model: str | None, count: int = 5) -> list[str]:
     try:
         llm = get_llm(model)
+        aspects = ("origins and history; key facts, dates and numbers; how it works; "
+                   "adoption, use cases and key players; challenges, limitations and latest developments")
+        if count > 5:
+            # More queries must mean more distinct ground, not rephrasings.
+            aspects += ("; technical specification details; architecture and components; tooling, SDKs "
+                        "and implementations; security; comparisons with alternatives; named case "
+                        "studies; governance and community; roadmap")
         data = _chat_json(
             llm,
-            "You plan web research. Output JSON only: {\"queries\": [str, 5 items]}.",
-            f"Topic: {topic}\nGive 5 short web-search queries that together cover: "
-            "origins and history; key facts, dates and numbers; how it works; "
-            "adoption, use cases and key players; challenges, limitations and latest developments.",
+            f"You plan web research. Output JSON only: {{\"queries\": [str, {count} items]}}.",
+            f"Topic: {topic}\nGive {count} short web-search queries, each on a different aspect, "
+            f"that together cover: {aspects}.",
         )
         queries = [q.strip() for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
         if len(queries) >= 3:
-            return queries[:6]
+            return queries[:count]
     except Exception:
         pass
     return [
@@ -188,7 +222,8 @@ def _plan_queries(topic: str, model: str | None) -> list[str]:
     ]
 
 
-def _synthesize(topic: str, excerpts: str, model: str | None) -> str:
+def _synthesize(topic: str, excerpts: str, model: str | None,
+                num_slides: int | None = None, max_chars: int = MAX_BRIEF_CHARS) -> str:
     llm = get_llm(model)
     system = (
         "You are a research analyst. Write a structured research brief from "
@@ -199,15 +234,26 @@ def _synthesize(topic: str, excerpts: str, model: str | None) -> str:
         "Key facts / Timeline / How it works / Use cases and adoption / "
         "Challenges and limitations."
     )
+    if num_slides and num_slides > 16:
+        # A long deck needs one distinct sub-topic per slide in the brief.
+        system += (
+            f" The brief feeds a {num_slides}-slide deck: after those sections, add a section "
+            f"'Distinct sub-topics' listing up to {num_slides} specific, non-overlapping sub-topics the "
+            "excerpts support, each with its supporting facts. Never pad: list only what the "
+            "excerpts cover."
+        )
     resp = llm.invoke([
         {"role": "system", "content": system},
         {"role": "user", "content": f"Topic: {topic}\n\nExcerpts (each headed by its source):\n{excerpts}"},
     ])
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
-    return content.strip()[:MAX_BRIEF_CHARS]
+    return content.strip()[:max_chars]
 
 
-def research_topic(topic: str, model: str | None = None, shallow: bool = False) -> ResearchResult:
+def research_topic(topic: str, model: str | None = None, shallow: bool = False,
+                   num_slides: int | None = None) -> ResearchResult:
+    """num_slides sizes the research: more queries, sources and brief for
+    longer decks (see research_budget)."""
     from .search_grounding import _topic_words, ground_topic, is_relevant
 
     if shallow:
@@ -215,20 +261,21 @@ def research_topic(topic: str, model: str | None = None, shallow: bool = False) 
         return ResearchResult(
             brief=found.text, mode="search" if found.found else "none", sources=found.sources,
         )
-    queries = _plan_queries(topic, model)
+    budget = research_budget(num_slides)
+    queries = _plan_queries(topic, model, budget.queries)
     terms = _topic_words(topic)
     seen: set[str] = set()
     excerpts: list[str] = []
     sources: list[str] = []
     for query in queries:
-        if len(excerpts) >= MAX_PAGES:
+        if len(excerpts) >= budget.pages:
             break
         try:
             results = _search(query)
         except Exception:
             continue
         for url, title, snippet, text in results:
-            if len(excerpts) >= MAX_PAGES:
+            if len(excerpts) >= budget.pages:
                 break
             if url in seen:
                 continue  # already read via an earlier query; the rest of this query's results still count
@@ -258,11 +305,11 @@ def research_topic(topic: str, model: str | None = None, shallow: bool = False) 
         if found and found.found:
             return ResearchResult(brief=found.text, mode="search", sources=found.sources, queries=queries)
         return ResearchResult(brief="", mode="none", sources=[], queries=queries)
-    raw = "\n\n".join(excerpts)[:MAX_RAW_CHARS]
+    raw = "\n\n".join(excerpts)[:budget.raw_chars]
     try:
-        brief = _synthesize(topic, raw, model)
+        brief = _synthesize(topic, raw, model, num_slides=num_slides, max_chars=budget.brief_chars)
     except Exception:
-        brief = raw[:MAX_BRIEF_CHARS]
+        brief = raw[:budget.brief_chars]
     if not brief.strip():
-        brief = raw[:MAX_BRIEF_CHARS]
+        brief = raw[:budget.brief_chars]
     return ResearchResult(brief=brief, mode="research", sources=sources, queries=queries)

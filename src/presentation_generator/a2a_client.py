@@ -16,6 +16,8 @@ from a2a.client import A2AClient
 from a2a.client.card_resolver import A2ACardResolver
 from a2a.types import Message, MessageSendParams, Part, SendMessageRequest, TextPart
 
+from .tracing import TRACE_KEY, trace_headers
+
 
 def _artifact_text(result) -> str:
     # SendMessageResponse.result is a Task (with artifacts) or a Message.
@@ -54,5 +56,10 @@ async def call_agent(base_url: str, payload: dict, timeout: float = 600) -> dict
         return json.loads(_artifact_text(root.result))
 
 
-def call_agent_sync(base_url: str, payload: dict, timeout: float = 600) -> dict:
+def call_agent_sync(base_url: str, payload: dict, timeout: float = 600, trace: dict | None = None) -> dict:
+    """trace: the caller's trace_headers(). Read here by default; pass it
+    explicitly from worker threads, which don't see the node's trace."""
+    headers = trace_headers() if trace is None else trace
+    if headers:
+        payload = {**payload, TRACE_KEY: headers}
     return asyncio.run(call_agent(base_url, payload, timeout=timeout))

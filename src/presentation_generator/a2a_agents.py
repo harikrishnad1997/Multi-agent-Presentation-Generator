@@ -37,7 +37,7 @@ from a2a.types import (
 )
 
 from .graph import edit_deck, plan_outline, render_deck_charts, review_deck, write_one_slide
-from .tracing import span as opik_span
+from .tracing import TRACE_KEY, span as opik_span
 from .latex_utils import render_beamer
 from .latex_agent import create_slide_latex
 from .models import Deck, Outline, SlideBrief, SlideContent
@@ -83,10 +83,12 @@ class _JsonAgent(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         payload = _payload(context)
+        # The orchestrator's trace ids, so this span nests under its trace.
+        parent = payload.pop(TRACE_KEY, None)
         # Opik span per agent call (no-op without OPIK_API_KEY; small
         # metadata only — never the full payload). Runs inside the
         # thread with the work, so the span covers the LLM call.
-        with opik_span(f"presentation-{self.agent_name}", metadata={"agent": self.agent_name}):
+        with opik_span(f"presentation-{self.agent_name}", metadata={"agent": self.agent_name}, parent=parent):
             result = await asyncio.to_thread(self.run, payload)
         await _finish(event_queue, context, result, self.artifact_name)
 

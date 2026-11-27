@@ -52,7 +52,7 @@ def render_slide(slide) -> str:
         lines.extend([r"  \begin{columns}[T]", r"    \begin{column}{0.58\textwidth}"])
     lines.append(r"  \begin{itemize}")
     if is_references:
-        lines.append(r"    \footnotesize")
+        lines.append(r"    \scriptsize")
     for bullet in slide.bullets:
         if is_references:
             match = re.search(r"https?://\S+", bullet)

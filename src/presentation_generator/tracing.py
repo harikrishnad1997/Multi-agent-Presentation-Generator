@@ -180,12 +180,36 @@ def _span_client():
     return _SPAN_CLIENT
 
 
+# Payload key the A2A orchestrator uses to tell an agent which trace and
+# span it was called from.
+TRACE_KEY = "_opik_trace"
+
+
+def trace_headers() -> dict:
+    """The current trace and span ids ({'opik_trace_id', 'opik_parent_span_id'}),
+    read inside a traced LangGraph node; {} when tracing is off or there is
+    no current trace. Sent with each A2A call so the agent's span nests
+    under the orchestrator's trace instead of starting its own."""
+    if not enabled():
+        return {}
+    try:
+        from opik import opik_context
+
+        return dict(opik_context.get_distributed_trace_headers() or {})
+    except Exception:
+        return {}
+
+
 @contextlib.contextmanager
-def span(name: str, metadata: dict | None = None):
-    """Explicit Opik trace for one agent call (used by the A2A agents,
+def span(name: str, metadata: dict | None = None, parent: dict | None = None):
+    """Explicit Opik span for one agent call (used by the A2A agents,
     where a decorator would capture the agent object as input). A no-op
     when tracing is off, and any Opik failure is swallowed — the wrapped
     work always runs.
+
+    parent: trace_headers() from the caller. With it, the span is attached
+    to the orchestrator's trace; without it (an agent called directly),
+    it is logged as a trace of its own.
 
     The trace is sent once, complete, when the call finishes (start and
     end time together). Creating it up front and calling Trace.end()
@@ -203,12 +227,20 @@ def span(name: str, metadata: dict | None = None):
         raise
     finally:
         try:
-            _span_client().trace(
-                name=name, start_time=start,
-                end_time=datetime.datetime.now(datetime.timezone.utc), metadata=meta,
-            )
+            end = datetime.datetime.now(datetime.timezone.utc)
+            parent = parent or {}
+            if parent.get("opik_trace_id") and parent.get("opik_parent_span_id"):
+                _span_client().span(
+                    trace_id=parent["opik_trace_id"], parent_span_id=parent["opik_parent_span_id"],
+                    name=name, start_time=start, end_time=end, metadata=meta, project_name=_PROJECT,
+                )
+            else:
+                _span_client().trace(name=name, start_time=start, end_time=end, metadata=meta)
         except Exception:
             pass
+
+
+FLUSH_TIMEOUT = 20  # seconds
 
 
 def flush():
@@ -219,10 +251,12 @@ def flush():
     try:
         client = _REQUEST_OPIK_CLIENT.get()
         if client is not None:
-            client.flush()
+            # Bounded: with the Opik server resetting connections an
+            # unbounded flush can hold the finished build open.
+            client.flush(timeout=FLUSH_TIMEOUT)
             return
         import opik
 
-        opik.flush_tracker()
+        opik.flush_tracker(timeout=FLUSH_TIMEOUT)
     except Exception:
         pass
