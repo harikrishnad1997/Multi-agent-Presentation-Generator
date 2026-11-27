@@ -113,7 +113,11 @@ def _chat_json(llm, system: str, user: str) -> dict:
 _ENDING_WORDS = ("conclusion", "summary", "takeaway", "final thought", "looking ahead", "wrap-up", "wrap up")
 
 
-_TITLE_STOPWORDS = {"the", "a", "an", "and", "of", "for", "in", "on", "to", "with", "how", "what", "why"}
+# Connectives as well as articles: v10 flagged 'Adoption Across Industries'
+# and 'Collaboration Across Vendors' as overlapping just for sharing 'across'.
+_TITLE_STOPWORDS = {"the", "a", "an", "and", "or", "of", "for", "in", "on", "to", "with", "how", "what", "why",
+                    "across", "between", "beyond", "from", "into", "within", "through", "via", "vs", "versus",
+                    "about", "at", "by", "as", "its", "their", "your", "our"}
 
 
 def norm_title_key(title: str, stopwords: set[str] | None = None) -> str:
@@ -176,9 +180,61 @@ _OVERLAP_IGNORE = {"case", "study", "studies", "key", "overview", "introduction"
 _PLACEHOLDER = re.compile(r"\b(?i:company|organi[sz]ation|client|vendor|firm|customer|enterprise|business)\s+[A-Z]\b|\b(?i:acme|xyz corp)\b")
 
 
+_SUFFIXES = ("ations", "ation", "atives", "ative", "isons", "ison", "ities", "ity", "ments", "ment",
+             "ings", "ing", "ions", "ion", "ives", "ive", "ed", "es", "s")
+
+
+def _stem(word: str) -> str:
+    """Crude suffix strip so 'Comparison' / 'Comparative' and 'Integration'
+    / 'Integrating' count as the same theme (v6 shipped 'Comparison with
+    MCP' next to 'Comparative Analysis of Protocols')."""
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)]
+    return word
+
+
 def _content_words(title: str, topic_words: set[str]) -> set[str]:
-    words = {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2}
-    return words - {w.rstrip("s") for w in _TITLE_STOPWORDS | _OVERLAP_IGNORE | topic_words}
+    words = {_stem(w) for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2}
+    return words - {_stem(w) for w in _TITLE_STOPWORDS | _OVERLAP_IGNORE | topic_words}
+
+
+SAME_TOPIC_ROUNDS = 3
+
+
+def same_topic_slides(outline: Outline, llm) -> set[int]:
+    """Ask the model which slides repeat an earlier slide's sub-topic under
+    different words — the word checks cannot see that 'Industry
+    Applications' repeats 'Use Cases of A2A' (v6 failed review on it).
+    Returns the numbers of the LATER slide of each pair; best effort."""
+    body = [s for s in outline.slides if not _is_ending(s.title)]
+    system = (
+        "You check a presentation outline for repeated sub-topics. Output JSON only. "
+        "Schema: {\"pairs\": [{\"earlier\": int, \"later\": int, \"reason\": str}]}. "
+        "List a pair only when the two slides would teach the audience substantially the same "
+        "thing (same sub-topic under different words, e.g. 'Use Cases' and 'Industry Applications', "
+        "or 'Future Directions' and 'Vision for the Future'). Slides on related but distinct aspects "
+        "are not pairs. Return {\"pairs\": []} if there are none."
+    )
+    user = "\n".join(f"{s.number}. {s.title} — {s.brief}" for s in body)
+    numbers = {s.number for s in body}
+    # Deterministic judge: at the planner's temperature (0.7) three checks
+    # of the same v8 outline flagged three different sets of slides.
+    if "temperature" in getattr(type(llm), "model_fields", {}):
+        llm = llm.model_copy(update={"temperature": 0})
+    try:
+        data = _chat_json(llm, system, user)
+    except Exception:
+        return set()
+    later: set[int] = set()
+    for pair in data.get("pairs", []) or []:
+        try:
+            a, b = int(pair["earlier"]), int(pair["later"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a != b and a in numbers and b in numbers:
+            later.add(max(a, b))
+    return later
 
 
 def outline_flow_problems(outline: Outline, topic: str = "") -> list[str]:
@@ -206,13 +262,16 @@ def outline_flow_problems(outline: Outline, topic: str = "") -> list[str]:
     return problems
 
 
-def resolve_overlaps(outline: Outline, topic: str, llm, source_text: str = "") -> Outline:
+def resolve_overlaps(outline: Outline, topic: str, llm, source_text: str = "",
+                     same_topic: set[int] | None = None) -> Outline:
     """Replace each slide that overlaps an EARLIER slide (shared title
     theme) or uses a placeholder name with a fresh, distinct brief, in
     the same position and keeping its chart slot. Runs once the planner's
     own retries still leave flow problems — it ignored the feedback for
     'Future of A2A' / 'Future Challenges' / 'Potential for Future
-    Protocols' and 'Community Support' / 'Community Contributions'."""
+    Protocols' and 'Community Support' / 'Community Contributions'.
+    same_topic: slide numbers to replace as well (from same_topic_slides)."""
+    same_topic = same_topic or set()
     topic_words = set(re.findall(r"[a-z0-9]+", f"{topic} {outline.title}".lower()))
     covered: set[str] = set()
     replace: list[SlideBrief] = []
@@ -220,23 +279,34 @@ def resolve_overlaps(outline: Outline, topic: str, llm, source_text: str = "") -
         if _is_ending(slide.title):
             continue
         words = _content_words(slide.title, topic_words)
-        if (words & covered) or _PLACEHOLDER.search(f"{slide.title} {slide.brief}"):
+        if (words & covered) or slide.number in same_topic or _PLACEHOLDER.search(f"{slide.title} {slide.brief}"):
             replace.append(slide)
         else:
             covered |= words
     if not replace:
         return outline
-    keep_titles = [s.title for s in outline.slides if s not in replace]
+    # Every current title, replaced ones included, so the fresh briefs
+    # don't come back as the same sub-topic.
+    all_titles = [s.title for s in outline.slides]
     try:
-        fresh = _fill_briefs(llm, topic, outline.title, keep_titles, len(replace), 0,
+        # Ask for spares: one candidate per slot kept reusing a covered word
+        # ('challenge'), so v10 shipped 'Challenges in Adoption',
+        # 'Challenges of A2A Implementation' and 'Challenges in Implementation'.
+        fresh = _fill_briefs(llm, topic, outline.title, all_titles, 2 * len(replace) + 2, 0,
                              avoid_words=sorted(covered), source_text=source_text)
     except Exception:
         return outline  # best effort: an overlapping deck beats a broken plan
     accepted: dict[int, SlideBrief] = {}
-    for old, new in zip(replace, fresh):
-        words = _content_words(new.title, topic_words)
-        if words & covered or _is_ending(new.title):
-            continue  # still overlaps: keep the original slide
+    candidates = iter(fresh)
+    for old in replace:
+        new = None
+        for cand in candidates:
+            words = _content_words(cand.title, topic_words)
+            if words and not words & covered and not _is_ending(cand.title):
+                new = cand
+                break
+        if new is None:
+            break  # out of candidates: keep the remaining originals
         covered |= words
         new.number, new.has_visual = old.number, old.has_visual
         new.visual_hint = f"Quantitative comparison or trend for: {new.title}" if old.has_visual else ""
@@ -397,8 +467,14 @@ def plan_outline(topic: str, author: str, num_slides: int, model: str | None,
     # the editor and reviewer rather than forcing a mechanical fix.
     if problems:
         outline = _repair_outline(outline, n, visual_target, llm=llm, topic=topic)
-    if outline_flow_problems(outline, topic):
-        outline = resolve_overlaps(outline, topic, llm, source_text=source_text)
+    # Check again after each replacement: fresh briefs are only screened by
+    # words, and in v8 they brought back 'Overview of A2A Protocol' next to
+    # the Introduction and a second comparison slide.
+    for _round in range(SAME_TOPIC_ROUNDS):
+        same_topic = same_topic_slides(outline, llm)
+        if not same_topic and not outline_flow_problems(outline, topic):
+            break
+        outline = resolve_overlaps(outline, topic, llm, source_text=source_text, same_topic=same_topic)
     return outline
 
 
@@ -606,11 +682,19 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
                      "invent facts:\n" + source_material)
         try:
             fragment = Deck.model_validate(_chat_json(llm, system, user))
+            # Only this chunk's slides: the editor sees the rest of the deck
+            # and in v11 the last chunk returned slides 8-12 (dropped from
+            # their own chunk), which moved them to the end of the deck.
+            chunk_keys = {norm_title_key(s.title) for s in chunk}
+            foreign = {norm_title_key(s.title) for s in slides if s not in chunk} - chunk_keys
+            own = [s for s in fragment.slides if norm_title_key(s.title) not in foreign]
+            if len(own) < len(chunk) - 1:
+                raise ValueError("chunk editor dropped more than one slide")  # keep the chunk as written
             # Trust the chunk's order, not its numbers: the LLM often
             # renumbers a chunk from 1, and sorting the whole deck by those
             # numbers interleaved chunks (the 30-slide A2A deck put its
             # Conclusion at slide 19).
-            edited.extend(sorted(fragment.slides, key=lambda x: x.number))
+            edited.extend(sorted(own, key=lambda x: x.number))
         except Exception:
             edited.extend(chunk)  # editor failure must not lose slides
     for position, slide in enumerate(edited, start=1):
@@ -642,7 +726,12 @@ def edit_deck(outline: Outline, slides: list[SlideContent], model: str | None, r
         try:
             ending = edited[-1] if edited and _is_ending(edited[-1].title) else None
             body = edited[:-1] if ending else edited
-            extra_briefs = _fill_briefs(llm, topic, outline.title, [s.title for s in edited], target - len(edited), len(body) + 1)
+            # Grounded in the research and screened against covered themes:
+            # the ungrounded fill invented v10's off-outline 'Performance
+            # Metrics for A2A' after the dedupe dropped a duplicate slide.
+            covered = sorted(set().union(*(_content_words(s.title, topic_words) for s in edited)))
+            extra_briefs = _fill_briefs(llm, topic, outline.title, [s.title for s in edited], target - len(edited),
+                                        len(body) + 1, avoid_words=covered, source_text=source_text)
             for brief in extra_briefs:
                 prev_t = body[-1].title if body else ""
                 next_t = ending.title if ending else ""
@@ -779,7 +868,7 @@ def render_images(state: PresentationState) -> dict:
     return {"deck": deck.model_dump(), "image_count": count}
 
 
-REFS_PER_SLIDE = 4
+REFS_PER_SLIDE = 6  # rendered \\scriptsize; at 4, 15 sources took 4 slides
 
 
 def _is_references(slide: SlideContent) -> bool:
@@ -805,7 +894,7 @@ def add_references(state: PresentationState) -> dict:
         deck.slides.append(SlideContent(
             number=len(deck.slides) + 1,
             title=title,
-            bullets=refs[start:start + 4],
+            bullets=refs[start:start + REFS_PER_SLIDE],
             notes="Sources used to prepare this presentation.",
         ))
     return {"deck": deck.model_dump()}
@@ -970,7 +1059,9 @@ def build_graph():
     builder.add_node("compile", compile_output)
 
     builder.add_edge(START, "planner")
-    builder.add_conditional_edges("planner", route_planner)
+    # The path map names where the Send fan-out goes; without it the drawn
+    # graph (Opik, get_graph) shows planner -> __end__ and nothing after.
+    builder.add_conditional_edges("planner", route_planner, ["write_slide"])
     builder.add_edge("write_slide", "editor")
     builder.add_edge("editor", "render_charts")
     builder.add_edge("render_charts", "image_agent")
@@ -1002,7 +1093,7 @@ def run(topic: str, author: str = "", institute: str = "", num_slides: int = 6,
         # the planner/writers must stick to.
         from .research import research_topic
 
-        found = research_topic(topic, model, shallow=shallow)
+        found = research_topic(topic, model, shallow=shallow, num_slides=num_slides)
         if found.brief:
             source_text = found.brief
             grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}

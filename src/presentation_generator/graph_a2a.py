@@ -30,6 +30,7 @@ from .graph import (
     route_reviewer,
 )
 from .latex_utils import render_beamer
+from .tracing import trace_headers
 from .models import Deck, Outline, ReviewResult, SlideContent
 
 DEFAULT_URLS = {name: f"http://127.0.0.1:{port}/" for name, port in PORTS.items()}
@@ -120,9 +121,12 @@ def make_a2a_graph(urls: dict | None = None):
         deck = Deck.model_validate(state["deck"])
         ordered = sorted(deck.slides, key=lambda s: s.number)
         # Launch one independent A2A LaTeX task per final slide. Executor.map
-        # returns in input order, so assembly stays deterministic.
+        # returns in input order, so assembly stays deterministic. The pool's
+        # threads don't see this node's trace, so read it here.
+        trace = trace_headers()
+
         def render_slide(slide: SlideContent) -> str:
-            return call_agent_sync(base["latex"], {"slide": slide.model_dump()})["latex_part"]
+            return call_agent_sync(base["latex"], {"slide": slide.model_dump()}, trace=trace)["latex_part"]
 
         with ThreadPoolExecutor(max_workers=max(1, len(ordered))) as pool:
             parts = list(pool.map(render_slide, ordered))
@@ -141,7 +145,9 @@ def make_a2a_graph(urls: dict | None = None):
     builder.add_node("compile", compile_output)
 
     builder.add_edge(START, "planner")
-    builder.add_conditional_edges("planner", route_planner)
+    # The path map names where the Send fan-out goes; without it the drawn
+    # graph (Opik, get_graph) shows planner -> __end__ and nothing after.
+    builder.add_conditional_edges("planner", route_planner, ["write_slide"])
     builder.add_edge("write_slide", "editor")
     builder.add_edge("editor", "render_charts")
     builder.add_edge("render_charts", "add_references")
@@ -165,7 +171,7 @@ def run_a2a(topic: str, author: str = "", institute: str = "", num_slides: int =
     if not source_text and search:
         from .research import research_topic
 
-        found = research_topic(topic, model, shallow=shallow)
+        found = research_topic(topic, model, shallow=shallow, num_slides=num_slides)
         if found.brief:
             source_text = found.brief
             grounding = {"mode": found.mode, "sources": found.sources, "queries": found.queries}
